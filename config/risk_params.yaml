@@ -1,0 +1,36 @@
+# Risk Governor Parameters
+
+# 状态优先级 (数字越大优先级越高)
+state_priority:
+  NORMAL: 0
+  DEGRADED: 1
+  CIRCUIT_BREAKER: 2
+  RECONCILING: 3
+  VENUE_HALT: 4
+
+# 闪崩保护 — 双触发 (ATR 偏离 OR 绝对收益率)
+flash_crash:
+  atr_period: 14
+  atr_multiplier: 3
+  abs_return_1s_threshold: 0.03
+  abs_return_5s_threshold: 0.05
+
+# 对账
+reconciliation:
+  check_interval_sec: 30
+  drift_threshold_pct: 0.01  # 1% 偏移触发告警
+  max_drift_before_halt: 0.05  # 5% 偏移触发 RECONCILING
+
+# 熔断分阶段平仓
+circuit_breaker:
+  attempt_flatten_timeout_sec: 10
+  staged_exit_batch_pct: 0.25  # 每批减仓 25%
+  staged_exit_interval_sec: 2
+
+# 故障恢复
+recovery:
+  exponential_backoff_base_sec: 5
+  max_backoff_sec: 300
+  cooldown_after_recovery_sec: 60
+  post_recovery_scale: 0.5
+  post_recovery_duration_sec: 3600

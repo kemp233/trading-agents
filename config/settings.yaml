@@ -1,0 +1,44 @@
+# Trading Agents — Global Settings
+
+system:
+  name: "Trading Agents v3"
+  log_level: INFO
+  timezone: "Asia/Shanghai"
+
+state_store:
+  backend: sqlite  # Phase 1: sqlite, Phase 2+: postgres
+  sqlite_path: "data/state.db"
+  wal_mode: true
+  busy_timeout_ms: 5000
+
+event_bus:
+  backend: asyncio  # Phase 1: asyncio, Phase 2+: redis_streams
+  checkpoint_interval_sec: 60
+  dedup_table_ttl_hours: 24
+
+risk:
+  max_daily_loss_pct: 0.03        # 当日最大亏损 3%
+  max_notional_per_trade: 10000   # 单笔最大名义敞口
+  max_position_per_symbol: 5000   # 单品种最大持仓名义
+  circuit_breaker:
+    flash_crash_atr_multiplier: 3
+    flash_crash_return_1s: 0.03   # 1秒 3%
+    flash_crash_return_5s: 0.05   # 5秒 5%
+  recovery:
+    cooldown_seconds: 60
+    degraded_scale: 0.5
+    degraded_duration_seconds: 3600
+    max_backoff_seconds: 300
+
+outbox:
+  poll_interval_sec: 1
+  max_retries: 3
+  retry_backoff_base_sec: 5
+
+telegram:
+  enabled: true
+  alert_levels: [warning, critical]
+
+dashboard:
+  backend: streamlit  # Phase 1: streamlit, Phase 2+: fastapi
+  refresh_interval_sec: 5
