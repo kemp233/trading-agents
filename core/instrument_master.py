@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Dict, Literal, Optional
+
+import yaml
 
 
 AssetClass = Literal["crypto_perp", "cn_futures"]
@@ -128,3 +131,88 @@ def register_instrument(spec: InstrumentSpec) -> None:
     Overwrites existing symbol entry if present.
     """
     INSTRUMENTS[spec.symbol] = spec
+
+
+def register_instruments(specs: Dict[str, InstrumentSpec]) -> None:
+    """
+    Batch registration of instrument specs.
+    Overwrites existing symbol entries if present.
+    """
+    INSTRUMENTS.update(specs)
+
+
+def load_instruments_from_yaml(path: str) -> Dict[str, InstrumentSpec]:
+    """
+    Load instrument specifications from a YAML file.
+
+    Expected YAML structure:
+        instruments:
+            SYMBOL1:
+                asset_class: ...
+                tick_size: ...
+                lot_size: ...
+                contract_multiplier: ...
+                max_leverage: ...
+                margin_rate: ...
+                trading_hours: ...
+                price_limit_pct: ...
+            SYMBOL2:
+                ...
+
+    Args:
+        path: Path to the YAML file (relative or absolute)
+
+    Returns:
+        Dict mapping symbol to InstrumentSpec
+
+    Raises:
+        FileNotFoundError: If the YAML file does not exist
+        ValueError: If the YAML structure is invalid or parsing fails
+    """
+    yaml_path = Path(path)
+    if not yaml_path.is_absolute():
+        # Resolve relative paths against project root (core/ is one level under it)
+        yaml_path = (Path(__file__).resolve().parents[1] / yaml_path).resolve()
+
+    if not yaml_path.exists():
+        raise FileNotFoundError(f"Instrument configuration file not found: {yaml_path}")
+
+    try:
+        with open(yaml_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise ValueError(f"Failed to parse YAML file {yaml_path}: {e}") from e
+    except Exception as e:
+        raise ValueError(f"Failed to read file {yaml_path}: {e}") from e
+
+    if data is None:
+        raise ValueError(f"YAML file {yaml_path} is empty or contains no data")
+
+    if "instruments" not in data:
+        raise ValueError(f"Missing 'instruments' key in YAML file {yaml_path}")
+
+    instruments_data = data["instruments"]
+    if not isinstance(instruments_data, dict):
+        raise ValueError(f"'instruments' must be a dictionary in YAML file {yaml_path}")
+
+    specs: Dict[str, InstrumentSpec] = {}
+
+    for symbol, spec_data in instruments_data.items():
+        if not isinstance(spec_data, dict):
+            raise ValueError(
+                f"Instrument spec for '{symbol}' must be a dictionary in YAML file {yaml_path}"
+            )
+
+        try:
+            spec = InstrumentSpec.from_dict({**spec_data, "symbol": symbol})
+            specs[symbol] = spec
+        except KeyError as e:
+            raise ValueError(
+                f"Missing required field for instrument '{symbol}' in YAML file {yaml_path}: {e}"
+            ) from e
+        except Exception as e:
+            raise ValueError(
+                f"Failed to parse instrument '{symbol}' in YAML file {yaml_path}: {e}"
+            ) from e
+
+    return specs
