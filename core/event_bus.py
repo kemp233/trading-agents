@@ -1,62 +1,83 @@
-"""Event Bus — per-stream 序列号 + 去重 (v3)"""
+from __future__ import annotations
+
 import asyncio
 import logging
 from collections import defaultdict
-from typing import Callable, Awaitable
-from core.event_envelope import EventEnvelope
+from typing import Callable, Dict, List, Set
+
+from .event_envelope import EventEnvelope
+from .state_writer import StateWriter
 
 logger = logging.getLogger(__name__)
 
 
 class EventBus:
-    """进程内事件总线 (Phase 1)
-    
-    Phase 2 迁移到 Redis Streams 时,
-    保持相同接口, 替换底层实现即可。
-    """
+    def __init__(self, state_writer: StateWriter, checkpoint_interval: int = 100, dedup_cache_size: int = 10000) -> None:
+        self._state_writer = state_writer
+        self._checkpoint_interval = checkpoint_interval
+        self._dedup_cache_size = dedup_cache_size
+        self._subscribers: Dict[str, List[Callable]] = defaultdict(list)
+        self._processed_keys: Set[str] = set()
+        self._stream_sequences: Dict[str, int] = {}
+        self._event_count: int = 0
+        self._lock: asyncio.Lock = asyncio.Lock()
 
-    def __init__(self):
-        self._subscribers: dict[str, list[Callable]] = defaultdict(list)
-        self._stream_seqs: dict[str, int] = defaultdict(int)  # per-stream 计数器
-        self._processed: set[str] = set()  # 去重表
-        self._lock = asyncio.Lock()
+    async def start(self) -> None:
+        await self._load_checkpoint()
 
-    def subscribe(self, event_type: str, handler: Callable[[EventEnvelope], Awaitable]):
-        """订阅事件类型, '*' 订阅所有"""
+    def subscribe(self, event_type: str, handler: Callable) -> None:
         self._subscribers[event_type].append(handler)
 
-    async def publish(self, envelope: EventEnvelope):
-        """发布事件, 自动分配 stream_seq"""
+    async def publish(self, envelope: EventEnvelope) -> bool:
         async with self._lock:
-            # 去重检查
-            if envelope.idempotency_key in self._processed:
-                logger.debug(f"Duplicate event skipped: {envelope.idempotency_key}")
-                return
+            try:
+                envelope.validate()
+            except Exception:
+                return False
 
-            # 分配 per-stream 序列号
-            self._stream_seqs[envelope.stream_id] += 1
-            envelope.stream_seq = self._stream_seqs[envelope.stream_id]
+            if self._is_duplicate(envelope):
+                return False
 
-            # 记录已处理
-            self._processed.add(envelope.idempotency_key)
+            known_seq = self._stream_sequences.get(envelope.stream_id, -1)
+            if envelope.stream_seq < known_seq:
+                return False
 
-        # 分发给订阅者
-        handlers = (
-            self._subscribers.get(envelope.event_type, []) +
-            self._subscribers.get('*', [])
-        )
+            self._processed_keys.add(envelope.idempotency_key)
+            self._stream_sequences[envelope.stream_id] = envelope.stream_seq
+            self._event_count += 1
+
+            if self._event_count % self._checkpoint_interval == 0:
+                asyncio.create_task(self._save_checkpoint())
+
+        await self._notify_subscribers(envelope)
+        return True
+
+    def _is_duplicate(self, envelope: EventEnvelope) -> bool:
+        if envelope.idempotency_key in self._processed_keys:
+            return True
+        known_seq = self._stream_sequences.get(envelope.stream_id, -1)
+        if envelope.stream_seq <= known_seq:
+            return True
+        return False
+
+    async def _notify_subscribers(self, envelope: EventEnvelope) -> None:
+        handlers = self._subscribers.get(envelope.event_type, [])
         for handler in handlers:
             try:
-                await handler(envelope)
+                if asyncio.iscoroutinefunction(handler):
+                    await handler(envelope)
+                else:
+                    handler(envelope)
             except Exception as e:
-                logger.error(
-                    f"Handler error for {envelope.event_type}: {e}",
-                    exc_info=True
-                )
+                logger.exception(f"Handler {handler.__name__} failed for event {envelope.event_type}: {e}")
 
-    def get_stream_seq(self, stream_id: str) -> int:
-        return self._stream_seqs.get(stream_id, 0)
+    async def _save_checkpoint(self) -> None:
+        await self._state_writer.save_checkpoint(self._stream_sequences, self._processed_keys)
 
-    def clear_dedup_table(self):
-        """定期清理去重表 (由 Orchestrator 调度)"""
-        self._processed.clear()
+    async def _load_checkpoint(self) -> None:
+        self._stream_sequences = await self._state_writer.load_checkpoints()
+        self._processed_keys = await self._state_writer.load_processed_events(self._dedup_cache_size)
+
+    async def _cleanup_dedup_cache(self) -> None:
+        if len(self._processed_keys) > self._dedup_cache_size:
+            self._processed_keys = await self._state_writer.load_processed_events(self._dedup_cache_size)
