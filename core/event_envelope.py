@@ -44,6 +44,19 @@ def _is_tz_aware(dt: datetime) -> bool:
     return dt.tzinfo is not None and dt.utcoffset() is not None
 
 
+class EventType:
+    """String constants for the event_type field of EventEnvelope.
+
+    Using a plain class (not Enum) keeps backward compatibility: existing
+    code that passes raw string literals continues to work unchanged.
+    """
+
+    MARKET_TICK = "market_tick"
+    TRADE_INTENT = "trade_intent"
+    ORDER_UPDATE = "order_update"
+    ACCOUNT_UPDATE = "account_update"
+
+
 @dataclass(frozen=False, slots=True)
 class EventEnvelope:
     """
