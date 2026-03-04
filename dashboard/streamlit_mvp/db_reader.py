@@ -158,3 +158,76 @@ class DbReader:
         except Exception as exc:
             logger.error("get_today_monitor_alerts error: %s", exc)
         return rows
+
+    def get_latest_connection_status(self) -> dict:
+        """返回最新一条 connection_log 记录。"""
+        defaults: dict = {
+            "status": "DISCONNECTED",
+            "front_addr": "",
+            "session_id": "",
+            "ts": "",
+        }
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(
+                    "SELECT * FROM connection_log ORDER BY id DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+                if row:
+                    return dict(row)
+        except Exception as exc:
+            logger.error("get_latest_connection_status error: %s", exc)
+        return defaults
+
+    def get_latest_account_info(self) -> dict:
+        """返回最新一条 account_info 记录。"""
+        defaults: dict = {
+            "user_id": "",
+            "broker_id": "",
+            "trading_day": "",
+            "available": 0.0,
+            "margin": 0.0,
+            "equity": 0.0,
+        }
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(
+                    "SELECT * FROM account_info ORDER BY id DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+                if row:
+                    return dict(row)
+        except Exception as exc:
+            logger.error("get_latest_account_info error: %s", exc)
+        return defaults
+
+    def get_positions(self) -> list[dict]:
+        """返回所有持仓记录，按 symbol ASC 排序。"""
+        rows: list[dict] = []
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(
+                    "SELECT * FROM positions ORDER BY symbol ASC"
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+        except Exception as exc:
+            logger.error("get_positions error: %s", exc)
+        return rows
+
+    def get_connection_log(self, limit: int = 50) -> list[dict]:
+        """读取 connection_log 最近 N 条记录。"""
+        rows: list[dict] = []
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(
+                    "SELECT * FROM connection_log ORDER BY ts DESC LIMIT ?",
+                    (limit,),
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+        except Exception as exc:
+            logger.error("get_connection_log error: %s", exc)
+        return rows
