@@ -88,3 +88,66 @@ class CommandRouter:
             return {'agent': agent_name, 'command': command, 'result': result}
         except Exception as e:
             return {'error': f'{agent_name} 执行失败: {e}'}
+
+
+# ------------------------------------------------------------------
+# Issue #14: Streamlit UI 命令路由（同步包装）
+# ------------------------------------------------------------------
+
+def handle(command: str, reason: str = "", adapter=None, state_writer=None, risk_governor=None) -> dict:
+    """为 Streamlit UI 提供同步命令入口。
+
+    支持指令: HALT / RESUME / CANCEL_ALL
+    """
+    import asyncio
+    from datetime import datetime, timezone
+
+    logger.info("handle command: %s reason=%s", command, reason)
+
+    if command == "HALT":
+        if risk_governor is not None:
+            risk_governor.halt(reason or "manual")
+        if state_writer is not None:
+            from core.state_schema import SystemLogEntry
+            entry = SystemLogEntry(
+                ts=datetime.now(timezone.utc),
+                event_type="HALT",
+                detail=reason or "manual",
+            )
+            try:
+                asyncio.run(state_writer.write_system_log(entry))
+            except RuntimeError:
+                # 已在事件循环中则创建 task
+                loop = asyncio.get_event_loop()
+                loop.create_task(state_writer.write_system_log(entry))
+        return {"ok": True, "command": "HALT", "reason": reason}
+
+    elif command == "RESUME":
+        if risk_governor is not None:
+            risk_governor.resume()
+        if state_writer is not None:
+            from core.state_schema import SystemLogEntry
+            entry = SystemLogEntry(
+                ts=datetime.now(timezone.utc),
+                event_type="RESUME",
+                detail=None,
+            )
+            try:
+                asyncio.run(state_writer.write_system_log(entry))
+            except RuntimeError:
+                loop = asyncio.get_event_loop()
+                loop.create_task(state_writer.write_system_log(entry))
+        return {"ok": True, "command": "RESUME"}
+
+    elif command == "CANCEL_ALL":
+        if risk_governor is not None and adapter is not None:
+            try:
+                asyncio.run(risk_governor.cancel_all_orders(adapter))
+            except RuntimeError:
+                loop = asyncio.get_event_loop()
+                loop.create_task(risk_governor.cancel_all_orders(adapter))
+        return {"ok": True, "command": "CANCEL_ALL"}
+
+    else:
+        logger.warning("handle: unknown command %s", command)
+        return {"ok": False, "error": f"未知命令: {command}"}
