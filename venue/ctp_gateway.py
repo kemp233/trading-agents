@@ -3,121 +3,129 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from vnpy_ctp.gateway import CtpGateway
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# vnpy 事件类型常量
+EVENT_LOG     = "eLog"
+EVENT_ACCOUNT = "eAccount."
+
 
 class CtpGatewayWrapper:
-    """Wrapper for vnpy_ctp CtpGateway managing connection lifecycle."""
+    """封装 vnpy_ctp.CtpGateway，管理连接生命周期。"""
 
     def __init__(self, config: dict) -> None:
-        """Initialize CTP gateway with configuration.
+        self.broker_id: str  = config["broker_id"]
+        self.user_id: str    = config.get("user_id")   or os.getenv("CTP_USER_ID", "")
+        self.password: str   = config.get("password")  or os.getenv("CTP_PASSWORD", "")
+        self.app_id: str     = config["app_id"]
+        self.auth_code: str  = config.get("auth_code") or os.getenv("CTP_AUTH_CODE", "")
+        # 兼容 front_addr 与 ctp_front_addr 两种 key
+        self.front_addr: str = config.get("front_addr") or config.get("ctp_front_addr", "")
 
-        Args:
-            config: Dictionary containing:
-                - broker_id: CTP broker ID (e.g., "9999")
-                - user_id: CTP user ID (from env var CTP_USER_ID)
-                - password: CTP password (from env var CTP_PASSWORD)
-                - app_id: CTP application ID
-                - auth_code: CTP auth code (from env var CTP_AUTH_CODE)
-                - front_addr / ctp_front_addr: CTP front address
-        """
-        self.broker_id: str = config["broker_id"]
-        self.user_id: str = config.get("user_id") or os.getenv("CTP_USER_ID", "")
-        self.password: str = config.get("password") or os.getenv("CTP_PASSWORD", "")
-        self.app_id: str = config["app_id"]
-        self.auth_code: str = config.get("auth_code") or os.getenv("CTP_AUTH_CODE", "")
-        # Bug2 修复：兼容 "front_addr" 与 "ctp_front_addr" 两种 key 命名
-        self.front_addr: str = (
-            config.get("front_addr") or config.get("ctp_front_addr", "")
-        )
-
-        self._gateway: CtpGateway | None = None
-        self._connected: bool = False
-        self._login_event: asyncio.Event = asyncio.Event()
-        # Bug4 修复：用 _login_error 记录认证/登录失败原因，connect() 可立即感知
-        self._login_error: str | None = None
-        self._reconnect_task: asyncio.Task | None = None
-        self._reconnect_interval: float = 1.0
-        self._max_reconnect_interval: float = 60.0
+        self._event_engine  = None   # vnpy EventEngine
+        self._gateway       = None   # vnpy CtpGateway
+        self._connected: bool               = False
+        self._login_event: asyncio.Event    = asyncio.Event()
+        self._login_error: Optional[str]    = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._reconnect_task: Optional[asyncio.Task]    = None
         self._should_reconnect: bool = True
 
     @property
     def is_connected(self) -> bool:
-        """Return whether gateway is connected and authenticated."""
         return self._connected
 
-    async def connect(self) -> None:
-        """Connect to CTP front, authenticate, and login.
+    # ── vnpy 要求的中文设置字典 ───────────────────────────────────────
+    def _build_setting(self) -> dict:
+        return {
+            "用户名":   self.user_id,
+            "密码":     self.password,
+            "经纪商代码": self.broker_id,
+            "交易服务器": self.front_addr,
+            "行情服务器": self.front_addr,   # SimNow TD/MD 同地址
+            "产品名称": self.app_id,
+            "授权编码": self.auth_code,
+            "产品信息": "",
+        }
 
-        Raises:
-            ConnectionError: If authentication or login fails.
-            TimeoutError: If login does not complete within 30 seconds.
-        """
-        if self._connected:
-            logger.info("CTP gateway already connected")
+    # ── 事件回调（运行在 EventEngine 线程，需 call_soon_threadsafe）──
+    def _on_log(self, event) -> None:
+        log = event.data
+        msg: str = getattr(log, "msg", str(log))
+        logger.debug(f"[CTP] {msg}")
+
+        if self._login_event.is_set():
             return
 
+        # 登录成功关键词（vnpy_ctp 源码固定输出）
+        if "交易服务器登录成功" in msg:
+            self._connected = True
+            self._safe_set_event()
+        # 登录失败关键词
+        elif any(k in msg for k in ["登录失败", "密码错误", "AuthCode", "认证失败", "ErrorID"]):
+            self._login_error = f"CTP 登录失败: {msg}"
+            self._safe_set_event()
+
+    def _on_account(self, event) -> None:
+        """收到账户信息表示登录成功。"""
+        if not self._connected:
+            self._connected = True
+        if not self._login_event.is_set():
+            self._safe_set_event()
+
+    def _safe_set_event(self) -> None:
+        """线程安全地唤醒 asyncio.Event。"""
+        if self._loop and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._login_event.set)
+
+    # ── 公共接口 ────────────────────────────────────────────────────────────
+    async def connect(self) -> None:
+        if self._connected:
+            logger.info("CTP 已连接")
+            return
+
+        from vnpy.event import EventEngine
+        from vnpy_ctp.gateway import CtpGateway
+
         logger.info(
-            "Connecting to CTP gateway",
-            extra={
-                "broker_id": self.broker_id,
-                "user_id": self.user_id,
-                "front_addr": self.front_addr,
-            },
+            f"[CTP] 连接 broker={self.broker_id} user={self.user_id} addr={self.front_addr}"
         )
 
+        self._loop = asyncio.get_event_loop()
         self._login_event.clear()
         self._login_error = None
+        self._connected   = False
         self._should_reconnect = True
 
+        # 创建 EventEngine 并启动
+        self._event_engine = EventEngine()
+        self._event_engine.register(EVENT_LOG,     self._on_log)
+        self._event_engine.register(EVENT_ACCOUNT, self._on_account)
+        self._event_engine.start()
+
+        # 创建并连接 CtpGateway
+        self._gateway = CtpGateway(self._event_engine, "CTP")
+        self._gateway.connect(self._build_setting())
+
+        # 等待登录完成（最多 30 秒）
         try:
-            from vnpy_ctp.gateway import CtpGateway
-
-            self._gateway = CtpGateway()
-
-            self._gateway.on_front_connected = self._on_front_connected
-            self._gateway.on_front_disconnected = self._on_front_disconnected
-            self._gateway.on_rsp_authenticate = self._on_rsp_authenticate
-            self._gateway.on_rsp_user_login = self._on_rsp_user_login
-
-            self._gateway.connect(
-                {
-                    "td_address": self.front_addr,
-                    "brokerid": self.broker_id,
-                    "userid": self.user_id,
-                    "password": self.password,
-                    "appid": self.app_id,
-                    "auth_code": self.auth_code,
-                }
+            await asyncio.wait_for(self._login_event.wait(), timeout=30.0)
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                "CTP 登录超时（>30s）——请检查网络或前置地址是否可达"
             )
 
-            try:
-                await asyncio.wait_for(self._login_event.wait(), timeout=30.0)
-            except asyncio.TimeoutError:
-                logger.error("CTP login timeout after 30 seconds")
-                raise TimeoutError("CTP login timeout")
+        if self._login_error:
+            raise ConnectionError(self._login_error)
 
-            # Bug4 修复：_login_event 被 set 后检查是否因失败触发
-            if self._login_error:
-                raise ConnectionError(self._login_error)
+        logger.info("[CTP] 登录成功")
 
-            self._connected = True
-            logger.info("CTP gateway connected and authenticated successfully")
-
-            if self._reconnect_task is None or self._reconnect_task.done():
-                self._reconnect_task = asyncio.create_task(self._reconnect_loop())
-
-        except Exception as e:
-            logger.error(f"Failed to connect to CTP gateway: {e}", exc_info=True)
-            raise
+        if self._reconnect_task is None or self._reconnect_task.done():
+            self._reconnect_task = asyncio.create_task(self._reconnect_loop())
 
     async def disconnect(self) -> None:
-        """Disconnect from CTP gateway and stop reconnect loop."""
         self._should_reconnect = False
 
         if self._reconnect_task and not self._reconnect_task.done():
@@ -131,125 +139,51 @@ class CtpGatewayWrapper:
             try:
                 self._gateway.close()
             except Exception as e:
-                logger.warning(f"Error closing CTP gateway: {e}")
+                logger.warning(f"[CTP] 关闭网关异常: {e}")
+
+        if self._event_engine:
+            try:
+                self._event_engine.stop()
+            except Exception as e:
+                logger.warning(f"[CTP] 停止EventEngine异常: {e}")
 
         self._connected = False
         self._login_event.clear()
-        logger.info("CTP gateway disconnected")
-
-    def _on_front_connected(self) -> None:
-        """Handle OnFrontConnected callback."""
-        logger.info("CTP front connected")
-
-        if self._gateway:
-            req = {
-                "BrokerID": self.broker_id,
-                "UserID": self.user_id,
-                "AuthCode": self.auth_code,
-                "AppID": self.app_id,
-            }
-            self._gateway.authenticate(req, reqid=1)
-
-    def _on_front_disconnected(self, reason: int) -> None:
-        """Handle OnFrontDisconnected callback."""
-        logger.warning(f"CTP front disconnected, reason: {reason}")
-        self._connected = False
-        self._login_event.clear()
-
-    def _on_rsp_authenticate(
-        self, data: dict, error: dict | None, reqid: int, last: bool
-    ) -> None:
-        """Handle OnRspAuthenticate callback."""
-        if error and error.get("ErrorID", 0) != 0:
-            # Bug4 修复：记录错误并立即 set event，避免 connect() 傻等 30 秒超时
-            err_msg = f"CTP authentication failed (ErrorID={error.get('ErrorID')}): {error.get('ErrorMsg', 'Unknown error')}"
-            logger.error(err_msg)
-            self._login_error = err_msg
-            self._login_event.set()
-            return
-
-        logger.info("CTP authentication successful, proceeding to login")
-
-        if self._gateway:
-            req = {
-                "BrokerID": self.broker_id,
-                "UserID": self.user_id,
-                "Password": self.password,
-            }
-            self._gateway.login(req, reqid=2)
-
-    def _on_rsp_user_login(
-        self, data: dict, error: dict | None, reqid: int, last: bool
-    ) -> None:
-        """Handle OnRspUserLogin callback."""
-        if error and error.get("ErrorID", 0) != 0:
-            # Bug4 修复：记录错误并立即 set event，避免 connect() 傻等 30 秒超时
-            err_msg = f"CTP login failed (ErrorID={error.get('ErrorID')}): {error.get('ErrorMsg', 'Unknown error')}"
-            logger.error(err_msg)
-            self._login_error = err_msg
-            self._login_event.set()
-            return
-
-        logger.info("CTP login successful")
-        self._login_event.set()
+        logger.info("[CTP] 已断开连接")
 
     async def _reconnect_loop(self) -> None:
-        """Background task to handle automatic reconnection with exponential backoff."""
-        while self._should_reconnect:
-            await asyncio.sleep(self._reconnect_interval)
+        interval = 1.0
+        max_interval = 60.0
 
+        while self._should_reconnect:
+            await asyncio.sleep(interval)
             if self._connected or not self._should_reconnect:
+                interval = 1.0
                 continue
 
-            logger.info(
-                f"Attempting to reconnect to CTP (interval: {self._reconnect_interval:.1f}s)"
-            )
-
+            logger.info(f"[CTP] 尝试重连 (interval={interval:.0f}s)")
             try:
                 self._login_event.clear()
                 self._login_error = None
-
                 if self._gateway:
-                    self._gateway.connect(
-                        {
-                            "td_address": self.front_addr,
-                            "brokerid": self.broker_id,
-                            "userid": self.user_id,
-                            "password": self.password,
-                            "appid": self.app_id,
-                            "auth_code": self.auth_code,
-                        }
-                    )
-
+                    self._gateway.connect(self._build_setting())
                     try:
                         await asyncio.wait_for(self._login_event.wait(), timeout=30.0)
                         if self._login_error:
-                            logger.warning(f"CTP reconnection auth/login failed: {self._login_error}")
-                            self._reconnect_interval = min(
-                                self._reconnect_interval * 2, self._max_reconnect_interval
-                            )
+                            logger.warning(f"[CTP] 重连失败: {self._login_error}")
+                            interval = min(interval * 2, max_interval)
                         else:
                             self._connected = True
-                            self._reconnect_interval = 1.0
-                            logger.info("CTP reconnection successful")
+                            interval = 1.0
+                            logger.info("[CTP] 重连成功")
                     except asyncio.TimeoutError:
-                        logger.warning("CTP reconnection timeout")
-                        self._reconnect_interval = min(
-                            self._reconnect_interval * 2, self._max_reconnect_interval
-                        )
-
+                        logger.warning("[CTP] 重连超时")
+                        interval = min(interval * 2, max_interval)
             except Exception as e:
-                logger.error(f"CTP reconnection error: {e}", exc_info=True)
-                self._reconnect_interval = min(
-                    self._reconnect_interval * 2, self._max_reconnect_interval
-                )
+                logger.error(f"[CTP] 重连异常: {e}")
+                interval = min(interval * 2, max_interval)
 
-    def get_gateway(self) -> CtpGateway:
-        """Get the underlying vnpy_ctp CtpGateway instance.
-
-        Raises:
-            RuntimeError: If gateway is not initialized.
-        """
+    def get_gateway(self):
         if self._gateway is None:
-            raise RuntimeError("CTP gateway not initialized")
+            raise RuntimeError("CTP 网关未初始化")
         return self._gateway
