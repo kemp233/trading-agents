@@ -1,0 +1,80 @@
+# ============================================================
+# CI: Futures 合规隔离检查
+# 确保 futures/ 目录下不导入任何加密货币相关包
+# 触发条件: 任何涉及 futures/ 的 push 或 PR
+# ============================================================
+
+name: futures-isolation-check
+
+on:
+  push:
+    paths:
+      - 'futures/**'
+  pull_request:
+    paths:
+      - 'futures/**'
+
+jobs:
+  isolation-check:
+    name: futures-isolation-check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run isolation check
+        run: |
+          python - <<'EOF'
+          import ast
+          import sys
+          from pathlib import Path
+
+          # 禁止在 futures/ 出现的包名
+          BANNED = {
+              "ccxt", "web3", "binance", "websockets_crypto",
+              "eth_account", "eth_utils", "solana",
+          }
+
+          violations = []
+          futures_dir = Path("futures")
+
+          for py_file in futures_dir.rglob("*.py"):
+              try:
+                  tree = ast.parse(py_file.read_text(encoding="utf-8"))
+              except SyntaxError as e:
+                  print(f"[WARN] 语法错误，跳过: {py_file} — {e}")
+                  continue
+
+              for node in ast.walk(tree):
+                  # import ccxt
+                  if isinstance(node, ast.Import):
+                      for alias in node.names:
+                          root = alias.name.split(".")[0]
+                          if root in BANNED:
+                              violations.append(
+                                  f"  ❌ {py_file}:{node.lineno} — import {alias.name}"
+                              )
+                  # from ccxt import ...
+                  elif isinstance(node, ast.ImportFrom):
+                      if node.module:
+                          root = node.module.split(".")[0]
+                          if root in BANNED:
+                              violations.append(
+                                  f"  ❌ {py_file}:{node.lineno} — from {node.module} import ..."
+                              )
+
+          if violations:
+              print("\n[FAILED] futures/ 合规隔离检查不通过，发现以下违规导入：")
+              for v in violations:
+                  print(v)
+              print("\n请将加密货币相关代码移至 crypto/ 目录。")
+              sys.exit(1)
+          else:
+              print(f"[PASSED] futures/ 合规隔离检查通过，扫描了 {len(list(futures_dir.rglob('*.py')))} 个文件，未发现违规导入。")
+          EOF
