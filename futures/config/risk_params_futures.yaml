@@ -8,17 +8,26 @@
 
 # ── 应用标识 ─────────────────────────────────────────────────
 app_id: client_aiagentts_1.0.0
-broker_id: "9999"          # 填入东证期货 broker_id
-user_id: "256354"          # 填入仿真账号
-ctp_front_addr: "tcp://180.168.146.187:10130"  # 仿真前置地址
+broker_id: "9999"          # 东证期货 broker_id
+user_id: "256354"          # SimNow 仿真账号
+ctp_front_addr: "tcp://180.168.146.187:10130"  # SimNow 7x24 仿真前置地址
 
-# ── CTP 登录凭证（Bug3 修复：补充此两字段）─────────────────────
-# 若此处为空字符串，程序会自动 fallback 到环境变量：
-#   export CTP_PASSWORD=你的密码
-#   export CTP_AUTH_CODE=你的认证码
-# 生产环境建议使用环境变量，避免明文密码提交到代码库
-password: ""               # 仿真账号密码，或通过 CTP_PASSWORD 环境变量设置
-auth_code: ""              # 穿透式认证码，或通过 CTP_AUTH_CODE 环境变量设置
+# ── CTP 登录凭证 ────────────────────────────────────────────────
+#
+# ⚠️  密码禁止写入此文件！公开仓库中的文件任何人都可见。
+#      请在启动前设置环境变量：
+#
+#      Linux / macOS / WSL：
+#        export CTP_PASSWORD=你的SimNow密码
+#
+#      Windows PowerShell：
+#        $env:CTP_PASSWORD = "你的SimNow密码"
+#
+#      Windows CMD：
+#        set CTP_PASSWORD=你的SimNow密码
+#
+password: ""               # 留空！密码通过 CTP_PASSWORD 环境变量设置
+auth_code: "0000000000000000"  # SimNow 仿真环境标准认证码（16个零）
 
 # ── 数据库 ────────────────────────────────────────────────────
 db_path: ./data/futures.db
