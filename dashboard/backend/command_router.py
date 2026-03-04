@@ -42,10 +42,9 @@ COMMAND_MAP = {
     },
 }
 
-
 def parse_command(text: str) -> Optional[dict]:
     """解析 @Agent /command [args] 格式的指令"""
-    pattern = r'@(\w+)\s+(/\w+)\s*(.*)?'
+    pattern = r'@(\w+)\s+(/\w+)\s*(.*)?' 
     match = re.match(pattern, text.strip())
     if not match:
         return None
@@ -55,20 +54,16 @@ def parse_command(text: str) -> Optional[dict]:
         'args': match.group(3).strip() if match.group(3) else '',
     }
 
-
 class CommandRouter:
     def __init__(self, agents: dict):
         self._agents = agents
-
     async def execute(self, text: str) -> dict:
         parsed = parse_command(text)
         if not parsed:
             return {'error': f'无法解析指令: {text}'}
-
         agent_name = parsed['agent']
         command = parsed['command']
         args = parsed['args']
-
         if agent_name == 'all':
             results = {}
             for name, agent in self._agents.items():
@@ -78,11 +73,9 @@ class CommandRouter:
                 except Exception as e:
                     results[name] = f'Error: {e}'
             return {'agent': 'all', 'command': command, 'results': results}
-
         agent = self._agents.get(agent_name)
         if not agent:
             return {'error': f'未知 Agent: {agent_name}'}
-
         try:
             result = await agent.handle_command(command, args)
             return {'agent': agent_name, 'command': command, 'result': result}
@@ -100,13 +93,41 @@ def handle(command: str, reason: str = "", adapter=None, state_writer=None, risk
     支持指令: HALT / RESUME / CANCEL_ALL
     """
     import asyncio
+    import os
+    import sqlite3
     from datetime import datetime, timezone
+    from pathlib import Path
 
     logger.info("handle command: %s reason=%s", command, reason)
+
+    # ------------------------------------------------------------------
+    # Fallback: 当 risk_governor=None 时直接写 risk_state_log
+    # ------------------------------------------------------------------
+    _DEFAULT_DB = str(
+        Path(__file__).resolve().parent.parent.parent / "data" / "trading.db"
+    )
+    _DB_PATH = os.environ.get("AIAGENTTS_DB", _DEFAULT_DB)
+
+    def _write_risk_state_fallback(current: str, previous: str, rsn: str) -> None:
+        """同步写入 risk_state_log，失败只警告不抛异常。"""
+        try:
+            with sqlite3.connect(_DB_PATH) as conn:
+                conn.execute(
+                    "INSERT INTO risk_state_log "
+                    "(current_state, previous_state, state_changed_at, reason) "
+                    "VALUES (?, ?, ?, ?)",
+                    (current, previous, datetime.now(timezone.utc).isoformat(), rsn),
+                )
+                conn.commit()
+            logger.info("risk_state_log fallback written: %s -> %s", previous, current)
+        except Exception as exc:
+            logger.warning("_write_risk_state_fallback failed: %s", exc)
 
     if command == "HALT":
         if risk_governor is not None:
             risk_governor.halt(reason or "manual")
+        else:
+            _write_risk_state_fallback("VENUE_HALT", "NORMAL", reason or "manual")
         if state_writer is not None:
             from core.state_schema import SystemLogEntry
             entry = SystemLogEntry(
@@ -125,6 +146,8 @@ def handle(command: str, reason: str = "", adapter=None, state_writer=None, risk
     elif command == "RESUME":
         if risk_governor is not None:
             risk_governor.resume()
+        else:
+            _write_risk_state_fallback("NORMAL", "VENUE_HALT", "manual_resume")
         if state_writer is not None:
             from core.state_schema import SystemLogEntry
             entry = SystemLogEntry(
