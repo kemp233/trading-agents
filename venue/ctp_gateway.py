@@ -24,18 +24,23 @@ class CtpGatewayWrapper:
                 - password: CTP password (from env var CTP_PASSWORD)
                 - app_id: CTP application ID
                 - auth_code: CTP auth code (from env var CTP_AUTH_CODE)
-                - front_addr: CTP front address (e.g., "tcp://180.168.146.187:10130")
+                - front_addr / ctp_front_addr: CTP front address
         """
         self.broker_id: str = config["broker_id"]
         self.user_id: str = config.get("user_id") or os.getenv("CTP_USER_ID", "")
         self.password: str = config.get("password") or os.getenv("CTP_PASSWORD", "")
         self.app_id: str = config["app_id"]
         self.auth_code: str = config.get("auth_code") or os.getenv("CTP_AUTH_CODE", "")
-        self.front_addr: str = config["front_addr"]
+        # Bug2 修复：兼容 "front_addr" 与 "ctp_front_addr" 两种 key 命名
+        self.front_addr: str = (
+            config.get("front_addr") or config.get("ctp_front_addr", "")
+        )
 
         self._gateway: CtpGateway | None = None
         self._connected: bool = False
         self._login_event: asyncio.Event = asyncio.Event()
+        # Bug4 修复：用 _login_error 记录认证/登录失败原因，connect() 可立即感知
+        self._login_error: str | None = None
         self._reconnect_task: asyncio.Task | None = None
         self._reconnect_interval: float = 1.0
         self._max_reconnect_interval: float = 60.0
@@ -50,6 +55,7 @@ class CtpGatewayWrapper:
         """Connect to CTP front, authenticate, and login.
 
         Raises:
+            ConnectionError: If authentication or login fails.
             TimeoutError: If login does not complete within 30 seconds.
         """
         if self._connected:
@@ -66,6 +72,7 @@ class CtpGatewayWrapper:
         )
 
         self._login_event.clear()
+        self._login_error = None
         self._should_reconnect = True
 
         try:
@@ -94,6 +101,10 @@ class CtpGatewayWrapper:
             except asyncio.TimeoutError:
                 logger.error("CTP login timeout after 30 seconds")
                 raise TimeoutError("CTP login timeout")
+
+            # Bug4 修复：_login_event 被 set 后检查是否因失败触发
+            if self._login_error:
+                raise ConnectionError(self._login_error)
 
             self._connected = True
             logger.info("CTP gateway connected and authenticated successfully")
@@ -150,9 +161,11 @@ class CtpGatewayWrapper:
     ) -> None:
         """Handle OnRspAuthenticate callback."""
         if error and error.get("ErrorID", 0) != 0:
-            logger.error(
-                f"CTP authentication failed: {error.get('ErrorMsg', 'Unknown error')}"
-            )
+            # Bug4 修复：记录错误并立即 set event，避免 connect() 傻等 30 秒超时
+            err_msg = f"CTP authentication failed (ErrorID={error.get('ErrorID')}): {error.get('ErrorMsg', 'Unknown error')}"
+            logger.error(err_msg)
+            self._login_error = err_msg
+            self._login_event.set()
             return
 
         logger.info("CTP authentication successful, proceeding to login")
@@ -170,9 +183,11 @@ class CtpGatewayWrapper:
     ) -> None:
         """Handle OnRspUserLogin callback."""
         if error and error.get("ErrorID", 0) != 0:
-            logger.error(
-                f"CTP login failed: {error.get('ErrorMsg', 'Unknown error')}"
-            )
+            # Bug4 修复：记录错误并立即 set event，避免 connect() 傻等 30 秒超时
+            err_msg = f"CTP login failed (ErrorID={error.get('ErrorID')}): {error.get('ErrorMsg', 'Unknown error')}"
+            logger.error(err_msg)
+            self._login_error = err_msg
+            self._login_event.set()
             return
 
         logger.info("CTP login successful")
@@ -192,6 +207,7 @@ class CtpGatewayWrapper:
 
             try:
                 self._login_event.clear()
+                self._login_error = None
 
                 if self._gateway:
                     self._gateway.connect(
@@ -207,9 +223,15 @@ class CtpGatewayWrapper:
 
                     try:
                         await asyncio.wait_for(self._login_event.wait(), timeout=30.0)
-                        self._connected = True
-                        self._reconnect_interval = 1.0
-                        logger.info("CTP reconnection successful")
+                        if self._login_error:
+                            logger.warning(f"CTP reconnection auth/login failed: {self._login_error}")
+                            self._reconnect_interval = min(
+                                self._reconnect_interval * 2, self._max_reconnect_interval
+                            )
+                        else:
+                            self._connected = True
+                            self._reconnect_interval = 1.0
+                            logger.info("CTP reconnection successful")
                     except asyncio.TimeoutError:
                         logger.warning("CTP reconnection timeout")
                         self._reconnect_interval = min(

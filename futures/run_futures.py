@@ -64,14 +64,24 @@ async def main() -> None:
         max_retries=config.get("reconnect_max_retries", 5),
     )
 
-    # 4. CtpAdapter（#13 实现具体逻辑）
-    logger.info("[Futures] 初始化 CtpAdapter (stub)...")
-    ctp_adapter = CtpAdapter(
-        app_id=config.get("app_id", "client_aiagentts_1.0.0"),
-        broker_id=config.get("broker_id", ""),
-        user_id=config.get("user_id", ""),
-        front_addr=config.get("ctp_front_addr", ""),
-    )
+    # 4. CtpAdapter
+    # Bug1 修复：原代码用关键字参数调用，与 CTPAdapter.__init__(config: dict) 签名不符
+    # 改为将配置项封装为 dict 传入；同时补上原本缺失的 await connect()
+    logger.info("[Futures] 初始化 CtpAdapter...")
+    ctp_config = {
+        "broker_id":  config.get("broker_id", ""),
+        "user_id":    config.get("user_id", ""),
+        "app_id":     config.get("app_id", "client_aiagentts_1.0.0"),
+        "front_addr": config.get("ctp_front_addr", ""),
+        # password / auth_code 优先从 yaml 读取，若为空则 fallback 到环境变量
+        # CTP_PASSWORD / CTP_AUTH_CODE
+        "password":   config.get("password", ""),
+        "auth_code":  config.get("auth_code", ""),
+    }
+    ctp_adapter = CtpAdapter(config=ctp_config, state_writer=state_writer)
+    logger.info("[Futures] 连接 CTP 前置机...")
+    await ctp_adapter.connect()
+    logger.info("[Futures] CTP 连接成功。")
 
     # 5. 启动 Streamlit Dashboard（#15 实现）
     dashboard_path = Path(__file__).parent.parent / "dashboard" / "app_futures.py"
@@ -93,6 +103,7 @@ async def main() -> None:
     except KeyboardInterrupt:
         logger.info("[Futures] 收到停止信号，正在关闭...")
     finally:
+        await ctp_adapter.disconnect()
         await state_writer.close()
         logger.info("[Futures] 已安全关闭。")
 
