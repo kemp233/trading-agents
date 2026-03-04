@@ -9,7 +9,9 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock, patch, AsyncMock
+import sys
+from types import ModuleType
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -24,6 +26,24 @@ CONFIG = {
     "auth_code": "0000000000000000",
     "front_addr": "tcp://180.168.146.187:10130",
 }
+
+
+def _fake_vnpy_modules(gw_instance: MagicMock) -> dict:
+    """Build minimal fake vnpy_ctp.gateway sys.modules entries.
+
+    CtpGateway is imported *inside* connect() as a local import:
+        from vnpy_ctp.gateway import CtpGateway
+    so we must inject into sys.modules rather than patching the
+    venue.ctp_gateway namespace.
+    """
+    fake_gw_cls = MagicMock(return_value=gw_instance)
+
+    fake_vnpy = ModuleType("vnpy_ctp")
+    fake_vnpy_gateway = ModuleType("vnpy_ctp.gateway")
+    fake_vnpy_gateway.CtpGateway = fake_gw_cls  # type: ignore[attr-defined]
+    fake_vnpy.gateway = fake_vnpy_gateway  # type: ignore[attr-defined]
+
+    return {"vnpy_ctp": fake_vnpy, "vnpy_ctp.gateway": fake_vnpy_gateway}
 
 
 class TestCtpAuthFlow:
@@ -129,24 +149,22 @@ class TestCtpAuthFlow:
 
     @pytest.mark.asyncio
     async def test_connect_timeout_raises_timeout_error(self) -> None:
-        """connect() must raise TimeoutError when login event is never set."""
+        """connect() must raise TimeoutError when _login_event never fires.
+
+        CtpGateway is imported *inside* connect() as a local import, so we
+        inject a fake module via sys.modules instead of patching the
+        venue.ctp_gateway namespace (which doesn't carry that name).
+        """
         wrapper = self._make_wrapper()
 
-        async def mock_connect_never_fires(*args, **kwargs):
-            # Never set _login_event
-            await asyncio.sleep(999)
+        mock_gw_instance = MagicMock()
+        mock_gw_instance.connect = MagicMock()  # sync, does nothing
 
-        mock_gateway_cls = MagicMock()
-        mock_gateway_instance = MagicMock()
-        mock_gateway_cls.return_value = mock_gateway_instance
-        mock_gateway_instance.connect = mock_connect_never_fires
+        fake_modules = _fake_vnpy_modules(mock_gw_instance)
 
-        with patch("venue.ctp_gateway.CtpGateway", mock_gateway_cls):
-            with patch.object(wrapper, "_login_event") as mock_event:
-                mock_event.wait = AsyncMock(side_effect=asyncio.TimeoutError)
-                mock_event.clear = MagicMock()
-                mock_event.is_set = MagicMock(return_value=False)
-
+        with patch.dict(sys.modules, fake_modules):
+            # asyncio.wait_for times out → gateway raises TimeoutError
+            with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError):
                 with pytest.raises(TimeoutError, match="CTP login timeout"):
                     await wrapper.connect()
 
