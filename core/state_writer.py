@@ -7,7 +7,14 @@ from typing import Dict, List, Optional, Set
 
 import aiosqlite
 
-from .state_schema import OrderState, PositionState, RiskState
+from .state_schema import (
+    ErrorLogEntry,
+    MonitorLogEntry,
+    OrderState,
+    PositionState,
+    RiskState,
+    SystemLogEntry,
+)
 
 
 class StateWriter:
@@ -128,6 +135,57 @@ class StateWriter:
             async for row in cursor:
                 keys.add(row["idempotency_key"])
         return keys
+
+    # ------------------------------------------------------------------
+    # Issue #14: Direct-write log methods (bypass queue for append-only tables)
+    # ------------------------------------------------------------------
+
+    async def write_monitor_log(self, entry: MonitorLogEntry) -> None:
+        """写入阈值预警/触发记录到 monitor_log 表。"""
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO monitor_log (ts, field, current_value, limit_value, level) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    entry.ts.isoformat(),
+                    entry.field,
+                    entry.current_value,
+                    entry.limit_value,
+                    entry.level,
+                ),
+            )
+            await db.commit()
+
+    async def write_system_log(self, entry: SystemLogEntry) -> None:
+        """写入系统事件记录到 system_log 表。"""
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO system_log (ts, event_type, detail) VALUES (?, ?, ?)",
+                (
+                    entry.ts.isoformat(),
+                    entry.event_type,
+                    entry.detail,
+                ),
+            )
+            await db.commit()
+
+    async def write_error_log(self, entry: ErrorLogEntry) -> None:
+        """写入 CTP 错误回调记录到 error_log 表。"""
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO error_log (ts, error_id, error_msg, context) VALUES (?, ?, ?, ?)",
+                (
+                    entry.ts.isoformat(),
+                    entry.error_id,
+                    entry.error_msg,
+                    entry.context,
+                ),
+            )
+            await db.commit()
+
+    # ------------------------------------------------------------------
+    # Writer loop (internal)
+    # ------------------------------------------------------------------
 
     async def _writer_loop(self) -> None:
         while self._running:

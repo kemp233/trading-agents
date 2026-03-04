@@ -121,3 +121,45 @@ CREATE TABLE IF NOT EXISTS risk_windows (
     action              TEXT,
     created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- ============================================
+-- Issue #14: Monitor Log (阈值预警记录)
+-- ============================================
+CREATE TABLE IF NOT EXISTS monitor_log (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                  TEXT NOT NULL,              -- ISO8601 UTC
+    field               TEXT NOT NULL,              -- 触发阈值的字段名，如 "order_count"
+    current_value       INTEGER NOT NULL,
+    limit_value         INTEGER NOT NULL,
+    level               TEXT NOT NULL               -- "WARNING" 或 "BREACH"
+);
+
+CREATE INDEX IF NOT EXISTS idx_monitor_log_ts
+    ON monitor_log(ts);
+
+-- ============================================
+-- Issue #14: System Log (启停/异常事件)
+-- ============================================
+CREATE TABLE IF NOT EXISTS system_log (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                  TEXT NOT NULL,              -- ISO8601 UTC
+    event_type          TEXT NOT NULL,              -- 如 "STARTUP", "SHUTDOWN", "HALT", "RESUME"
+    detail              TEXT                        -- 可选附加说明
+);
+
+CREATE INDEX IF NOT EXISTS idx_system_log_ts
+    ON system_log(ts);
+
+-- ============================================
+-- Issue #14: Error Log (CTP 错误回调)
+-- ============================================
+CREATE TABLE IF NOT EXISTS error_log (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                  TEXT NOT NULL,              -- ISO8601 UTC
+    error_id            INTEGER NOT NULL,           -- CTP ErrorID
+    error_msg           TEXT NOT NULL,              -- 格式化后的错误描述
+    context             TEXT                        -- 发生错误时的上下文，如 "submit_order:rb2510"
+);
+
+CREATE INDEX IF NOT EXISTS idx_error_log_ts
+    ON error_log(ts);

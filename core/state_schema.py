@@ -1,4 +1,3 @@
-# core/state_schema.py
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
@@ -304,3 +303,44 @@ class RiskState:
             metadata=metadata,
             previous_state=previous_state,
         )
+
+
+# ----------------------------
+# Issue #14: Monitor / Log Entries
+# ----------------------------
+
+@dataclass(frozen=False, slots=True)
+class MonitorLogEntry:
+    """单条阈值预警/触发记录，写入 monitor_log 表。"""
+    ts: datetime
+    field: str          # 触发字段，如 "order_count"
+    current_value: int
+    limit_value: int
+    level: str          # "WARNING" 或 "BREACH"
+
+
+@dataclass(frozen=False, slots=True)
+class MonitorSnapshot:
+    """FuturesMonitor 当前计数快照，用于 UI 展示。"""
+    order_count: int
+    cancel_count: int
+    fill_count: int
+    duplicate_count: int
+    ts: datetime        # UTC 快照时间
+
+
+@dataclass(frozen=False, slots=True)
+class SystemLogEntry:
+    """系统事件记录（启动/停止/HALT/RESUME），写入 system_log 表。"""
+    ts: datetime
+    event_type: str     # 如 "STARTUP", "SHUTDOWN", "HALT", "RESUME"
+    detail: Optional[str] = None
+
+
+@dataclass(frozen=False, slots=True)
+class ErrorLogEntry:
+    """CTP 错误回调记录，写入 error_log 表。"""
+    ts: datetime
+    error_id: int       # CTP ErrorID
+    error_msg: str      # 格式化后的错误描述（由 ctp_error_codes.format_ctp_error 生成）
+    context: Optional[str] = None  # 发生错误时的上下文，如 "submit_order:rb2510"

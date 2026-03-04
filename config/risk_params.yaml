@@ -34,3 +34,11 @@ recovery:
   cooldown_after_recovery_sec: 60
   post_recovery_scale: 0.5
   post_recovery_duration_sec: 3600
+
+# ── Issue #14: 期货接入测试阈值（指标 #4、5、6）─────────────────────
+futures_monitor:
+  max_orders_per_day: 1000     # 当日最大报单笔数
+  max_cancels_per_day: 500     # 当日最大撤单笔数
+  max_duplicate_orders: 10     # 当日最大重复报单次数
+  max_lots_per_order: 100      # 单笔最大手数
+  warning_pct: 0.8             # 达到阈值 80% 时触发预警
