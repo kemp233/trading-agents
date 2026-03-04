@@ -572,3 +572,6 @@ class CTPAdapter:
             error_msg=formatted,
             context=f"{context_hint}",
         )
+
+# Alias for backwards compatibility with run_futures.py
+CtpAdapter = CTPAdapter
