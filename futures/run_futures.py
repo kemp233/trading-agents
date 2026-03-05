@@ -3,7 +3,7 @@ FUTURES ONLY - DO NOT IMPORT CRYPTO MODULES
 
 期货独立启动入口
 AppID: client_aiagentts_1.0.0
-开发人: 方馒涵
+开发人：方钰涵
 
 启动顺序：DB建表 → StateWriter → CtpAdapter → OutboxDispatcher → Streamlit
 
