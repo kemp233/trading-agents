@@ -47,3 +47,16 @@ E 层 · 基础设施 — 事件总线 / 模型路由 R0-R6 / Dashboard UI
 ## 技术栈
 
 Python 3.11+ / asyncio / SQLite(WAL) → PostgreSQL / Redis Streams / ccxt / vn.py / DeepSeek V3&R1 (离线) / Streamlit → React / FastAPI + WebSocket
+
+
+## Phase 2 Focus
+
+The current right-side multi-agent group chat work belongs to **Phase 2**.
+
+Phase 2 priorities:
+- Upgrade the Streamlit MVP into a production-grade multi-agent group chat drawer
+- Keep natural language chat plus `@agent -command...` explicit execution paths
+- Improve Chinese futures workflow collaboration for strategy, risk, news, portfolio, and reconciliation agents
+- Add approval-in-chat handling, archive-aware context, and stronger workflow feedback in the UI
+- Prepare the frontend interaction model for a future React/FastAPI/WebSocket migration
+

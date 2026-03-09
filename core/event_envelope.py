@@ -52,6 +52,7 @@ class EventType:
     """
 
     MARKET_TICK = "market_tick"
+    TA_SIGNAL = "ta_signal"
     TRADE_INTENT = "trade_intent"
     ORDER_UPDATE = "order_update"
     ACCOUNT_UPDATE = "account_update"

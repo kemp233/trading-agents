@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
@@ -6,341 +6,212 @@ from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from vnpy.trader.constant import Direction, Exchange, Offset, OrderType, Status
+from vnpy.trader.object import OrderData, PositionData
 
-from core.venue_order_spec import VenueOrderSpec, VenueOrderStatus, VenuePosition, VenueReceipt
+from core.venue_order_spec import VenueOrderSpec
 from venue.ctp_adapter import CTPAdapter
-from venue.ctp_callback_handler import CtpCallbackHandler
 
 
 @pytest.fixture
-def mock_gateway():
-    """Create a mock CTP gateway."""
-    gateway = MagicMock()
-    gateway.is_connected = True
-    gateway.send_order = MagicMock()
-    gateway.cancel_order = MagicMock()
-    gateway.query_order = MagicMock()
-    gateway.query_position = MagicMock()
-    gateway.on_rtn_order = None
-    gateway.on_rtn_trade = None
-    gateway.on_err_rtn_order_insert = None
-    gateway.on_err_rtn_order_action = None
-    gateway.on_rsp_qry_order = None
-    gateway.on_rsp_qry_investor_position = None
-    return gateway
-
-
-@pytest.fixture
-def ctp_config():
-    """Create CTP configuration."""
+def ctp_config() -> dict:
     return {
         "broker_id": "9999",
         "user_id": "test_user",
         "password": "test_pass",
-        "app_id": "client_tradagent_1.0.0",
-        "auth_code": "test_auth",
-        "front_addr": "tcp://180.168.146.187:10130",
+        "app_id": "simnow_client_test",
+        "auth_code": "0000000000000000",
+        "ctp_td_front_addr": "tcp://182.254.243.31:40001",
+        "ctp_md_front_addr": "tcp://182.254.243.31:40011",
+        "ctp_counter_env": "实盘",
     }
 
 
 @pytest.fixture
-def ctp_adapter(ctp_config, mock_gateway):
-    """Create CTP adapter with mocked gateway.
+def wrapper_mock() -> MagicMock:
+    wrapper = MagicMock()
+    wrapper.is_connected = True
+    wrapper.register_order_listener = MagicMock()
+    wrapper.register_trade_listener = MagicMock()
+    wrapper.connect = AsyncMock()
+    wrapper.disconnect = AsyncMock()
+    wrapper.send_order = MagicMock(return_value="CTP-001")
+    wrapper.cancel_order = MagicMock()
+    wrapper.refresh_positions = AsyncMock(return_value=[])
+    return wrapper
 
-    Patch target must be 'venue.ctp_adapter.CtpGatewayWrapper' (the name as
-    imported in the adapter module), NOT 'venue.ctp_gateway.CtpGatewayWrapper'.
-    Using the wrong module path means the adapter still instantiates the real
-    class and the mock is never used.
-    """
-    with patch("venue.ctp_adapter.CtpGatewayWrapper") as mock_wrapper:
-        wrapper_instance = MagicMock()
-        wrapper_instance.is_connected = True
-        wrapper_instance.get_gateway.return_value = mock_gateway
-        wrapper_instance.connect = AsyncMock()
-        wrapper_instance.disconnect = AsyncMock()
-        mock_wrapper.return_value = wrapper_instance
 
-        adapter = CTPAdapter(ctp_config)
-        yield adapter
+@pytest.fixture
+def adapter(ctp_config, wrapper_mock):
+    with patch("venue.ctp_adapter.CtpGatewayWrapper", return_value=wrapper_mock):
+        yield CTPAdapter(ctp_config)
 
 
 @pytest.mark.asyncio
-async def test_submit_order_success(ctp_adapter, mock_gateway):
-    """Test successful order submission returns SENT receipt."""
+async def test_submit_order_success(adapter, wrapper_mock) -> None:
     spec = VenueOrderSpec(
         symbol="rb2510",
         side="BUY",
         order_type="LIMIT",
         quantity=Decimal("1"),
         price=Decimal("4000"),
-        client_order_id="test_order_1",
+        client_order_id="ord-1",
     )
 
-    mock_gateway.send_order.return_value = None
-
-    async def trigger_callback():
+    async def trigger() -> None:
         await asyncio.sleep(0.01)
-        receipt = VenueReceipt(
-            client_order_id="test_order_1",
-            exchange_order_id="CTP-001",
-            status="SENT",
-            raw_response={},
-            timestamp=datetime.now(timezone.utc),
+        adapter._on_order_event(
+            OrderData(
+                gateway_name="CTP",
+                symbol="rb2510",
+                exchange=Exchange.SHFE,
+                orderid="CTP-001",
+                type=OrderType.LIMIT,
+                direction=Direction.LONG,
+                offset=Offset.OPEN,
+                price=4000,
+                volume=1,
+                traded=0,
+                status=Status.NOTTRADED,
+                datetime=datetime.now(timezone.utc),
+                reference="ord-1",
+            )
         )
-        ctp_adapter._on_order_update(receipt)
 
-    asyncio.create_task(trigger_callback())
+    asyncio.create_task(trigger())
+    receipt = await adapter.submit_order(spec)
 
-    receipt = await ctp_adapter.submit_order(spec)
-
-    assert receipt.client_order_id == "test_order_1"
+    assert receipt.client_order_id == "ord-1"
+    assert receipt.exchange_order_id == "CTP-001"
     assert receipt.status == "SENT"
-    assert ctp_adapter.submit_count == 1
+    assert wrapper_mock.send_order.called
 
 
 @pytest.mark.asyncio
-async def test_submit_order_timeout(ctp_adapter, mock_gateway):
-    """Test order submission timeout raises TimeoutError."""
+async def test_duplicate_order_is_rejected(adapter) -> None:
     spec = VenueOrderSpec(
         symbol="rb2510",
         side="BUY",
         order_type="LIMIT",
         quantity=Decimal("1"),
         price=Decimal("4000"),
-        client_order_id="test_order_timeout",
+        client_order_id="dup-1",
     )
+    adapter._submitted_orders.add("dup-1")
 
-    mock_gateway.send_order.return_value = None
+    receipt = await adapter.submit_order(spec)
 
-    with pytest.raises(TimeoutError, match="Order submission timeout"):
-        await ctp_adapter.submit_order(spec)
-
-
-@pytest.mark.asyncio
-async def test_cancel_order_success(ctp_adapter, mock_gateway):
-    """Test successful order cancellation returns CANCELED receipt."""
-    mock_gateway.cancel_order.return_value = None
-
-    async def trigger_callback():
-        await asyncio.sleep(0.01)
-        receipt = VenueReceipt(
-            client_order_id="test_order_1",
-            exchange_order_id="CTP-001",
-            status="CANCELED",
-            raw_response={},
-            timestamp=datetime.now(timezone.utc),
-        )
-        ctp_adapter._on_order_update(receipt)
-
-    asyncio.create_task(trigger_callback())
-
-    receipt = await ctp_adapter.cancel_order("test_order_1")
-
-    assert receipt.client_order_id == "test_order_1"
-    assert receipt.status == "CANCELED"
-    assert ctp_adapter.cancel_count == 1
-
-
-@pytest.mark.asyncio
-async def test_duplicate_order_rejected(ctp_adapter):
-    """Test duplicate order submission returns REJECTED receipt."""
-    spec = VenueOrderSpec(
-        symbol="rb2510",
-        side="BUY",
-        order_type="LIMIT",
-        quantity=Decimal("1"),
-        price=Decimal("4000"),
-        client_order_id="test_order_1",
-    )
-
-    ctp_adapter._submitted_orders.add("test_order_1")
-
-    receipt = await ctp_adapter.submit_order(spec)
-
-    assert receipt.client_order_id == "test_order_1"
     assert receipt.status == "REJECTED"
-    assert receipt.raw_response == {"error": "Duplicate client_order_id"}
+    assert receipt.raw_response["error"] == "Duplicate client_order_id"
 
 
 @pytest.mark.asyncio
-async def test_query_positions_empty(ctp_adapter, mock_gateway):
-    """Test query_positions returns empty list when no positions."""
-    mock_gateway.query_position.return_value = None
+async def test_cancel_order_uses_cached_order(adapter, wrapper_mock) -> None:
+    adapter._on_order_event(
+        OrderData(
+            gateway_name="CTP",
+            symbol="rb2510",
+            exchange=Exchange.SHFE,
+            orderid="CTP-002",
+            type=OrderType.LIMIT,
+            direction=Direction.LONG,
+            offset=Offset.OPEN,
+            price=4000,
+            volume=1,
+            traded=0,
+            status=Status.NOTTRADED,
+            datetime=datetime.now(timezone.utc),
+            reference="ord-2",
+        )
+    )
 
-    async def trigger_callback():
-        # query_positions() registers the local handler on mock_gateway before
-        # hitting the first await, so by the time this sleep finishes the
-        # attribute is already the real callable.
+    async def trigger() -> None:
         await asyncio.sleep(0.01)
-        mock_gateway.on_rsp_qry_investor_position({}, None, 1, True)
+        adapter._on_order_event(
+            OrderData(
+                gateway_name="CTP",
+                symbol="rb2510",
+                exchange=Exchange.SHFE,
+                orderid="CTP-002",
+                type=OrderType.LIMIT,
+                direction=Direction.LONG,
+                offset=Offset.OPEN,
+                price=4000,
+                volume=1,
+                traded=0,
+                status=Status.CANCELLED,
+                datetime=datetime.now(timezone.utc),
+                reference="ord-2",
+            )
+        )
 
-    asyncio.create_task(trigger_callback())
+    asyncio.create_task(trigger())
+    receipt = await adapter.cancel_order("ord-2")
 
-    positions = await ctp_adapter.query_positions()
-
-    assert positions == []
+    assert receipt.status == "CANCELED"
+    assert wrapper_mock.cancel_order.called
 
 
 @pytest.mark.asyncio
-async def test_query_positions_long(ctp_adapter, mock_gateway):
-    """Test query_positions correctly parses long position."""
-    mock_gateway.query_position.return_value = None
+async def test_query_positions_maps_vnpy_objects(adapter, wrapper_mock) -> None:
+    wrapper_mock.refresh_positions.return_value = [
+        PositionData(
+            gateway_name="CTP",
+            symbol="rb2510",
+            exchange=Exchange.SHFE,
+            direction=Direction.LONG,
+            volume=2,
+            price=4010,
+            pnl=150,
+        )
+    ]
 
-    position_data = {
-        "InstrumentID": "rb2510",
-        "Position": "10",
-        "YdPosition": "0",
-        "TodayPosition": "10",
-        "ShortPosition": "0",
-        "OpenPrice": "4000",
-    }
-
-    async def trigger_callback():
-        await asyncio.sleep(0.01)
-        mock_gateway.on_rsp_qry_investor_position(position_data, None, 1, True)
-
-    asyncio.create_task(trigger_callback())
-
-    positions = await ctp_adapter.query_positions()
+    positions = await adapter.query_positions()
 
     assert len(positions) == 1
     assert positions[0].symbol == "rb2510"
     assert positions[0].side == "LONG"
-    assert positions[0].quantity == Decimal("10")
-    assert positions[0].entry_price == Decimal("4000")
+    assert positions[0].quantity == Decimal("2")
 
 
 @pytest.mark.asyncio
-async def test_get_market_status_connected(ctp_adapter):
-    """Test get_market_status returns correct status when connected."""
-    status = await ctp_adapter.get_market_status("rb2510")
-
-    assert status.symbol == "rb2510"
-    assert status.can_market_order is True
-    assert status.can_limit_order is True
-    assert status.is_halted is False
-
-
-@pytest.mark.asyncio
-async def test_get_market_status_disconnected(ctp_adapter):
-    """Test get_market_status returns correct status when disconnected."""
-    ctp_adapter._gateway.is_connected = False
-
-    status = await ctp_adapter.get_market_status("rb2510")
-
-    assert status.symbol == "rb2510"
-    assert status.can_market_order is False
-    assert status.can_limit_order is False
-    assert status.is_halted is True
-
-
-@pytest.mark.asyncio
-async def test_submit_order_market(ctp_adapter, mock_gateway):
-    """Test market order submission."""
-    spec = VenueOrderSpec(
-        symbol="rb2510",
-        side="SELL",
-        order_type="MARKET",
-        quantity=Decimal("1"),
-        price=None,
-        client_order_id="test_market_order",
+async def test_query_order_uses_cached_status(adapter) -> None:
+    adapter._on_order_event(
+        OrderData(
+            gateway_name="CTP",
+            symbol="rb2510",
+            exchange=Exchange.SHFE,
+            orderid="CTP-003",
+            type=OrderType.LIMIT,
+            direction=Direction.SHORT,
+            offset=Offset.CLOSE,
+            price=3990,
+            volume=1,
+            traded=1,
+            status=Status.ALLTRADED,
+            datetime=datetime.now(timezone.utc),
+            reference="ord-3",
+        )
     )
 
-    mock_gateway.send_order.return_value = None
+    status = await adapter.query_order("ord-3")
 
-    async def trigger_callback():
-        await asyncio.sleep(0.01)
-        receipt = VenueReceipt(
-            client_order_id="test_market_order",
-            exchange_order_id="CTP-002",
-            status="SENT",
-            raw_response={},
-            timestamp=datetime.now(timezone.utc),
-        )
-        ctp_adapter._on_order_update(receipt)
-
-    asyncio.create_task(trigger_callback())
-
-    receipt = await ctp_adapter.submit_order(spec)
-
-    assert receipt.client_order_id == "test_market_order"
-    assert receipt.status == "SENT"
-
-
-@pytest.mark.asyncio
-async def test_submit_order_with_reduce_only(ctp_adapter, mock_gateway):
-    """Test order submission with reduce_only flag."""
-    spec = VenueOrderSpec(
-        symbol="rb2510",
-        side="SELL",
-        order_type="LIMIT",
-        quantity=Decimal("1"),
-        price=Decimal("4000"),
-        reduce_only=True,
-        client_order_id="test_reduce_order",
-    )
-
-    mock_gateway.send_order.return_value = None
-
-    async def trigger_callback():
-        await asyncio.sleep(0.01)
-        receipt = VenueReceipt(
-            client_order_id="test_reduce_order",
-            exchange_order_id="CTP-003",
-            status="SENT",
-            raw_response={},
-            timestamp=datetime.now(timezone.utc),
-        )
-        ctp_adapter._on_order_update(receipt)
-
-    asyncio.create_task(trigger_callback())
-
-    receipt = await ctp_adapter.submit_order(spec)
-
-    assert receipt.client_order_id == "test_reduce_order"
-    assert receipt.status == "SENT"
-
-
-@pytest.mark.asyncio
-async def test_query_order(ctp_adapter, mock_gateway):
-    """Test querying order status."""
-    mock_gateway.query_order.return_value = None
-
-    order_data = {
-        "OrderSysID": "CTP-004",
-        "OrderStatus": "1f",
-        "VolumeTraded": "1",
-        "AvgPrice": "4000",
-    }
-
-    async def trigger_callback():
-        await asyncio.sleep(0.01)
-        mock_gateway.on_rsp_qry_order(order_data, None, 1, True)
-
-    asyncio.create_task(trigger_callback())
-
-    status = await ctp_adapter.query_order("test_order_query")
-
-    assert status.client_order_id == "test_order_query"
-    assert status.exchange_order_id == "CTP-004"
+    assert status.exchange_order_id == "CTP-003"
     assert status.status == "FILLED"
     assert status.filled_quantity == Decimal("1")
-    assert status.filled_price == Decimal("4000")
 
 
 @pytest.mark.asyncio
-async def test_submit_order_while_disconnected(ctp_adapter):
-    """Test submit_order raises ConnectionError when disconnected."""
-    ctp_adapter._gateway.is_connected = False
-
+async def test_submit_order_requires_known_symbol(adapter) -> None:
     spec = VenueOrderSpec(
-        symbol="rb2510",
+        symbol="unknown999",
         side="BUY",
         order_type="LIMIT",
         quantity=Decimal("1"),
-        price=Decimal("4000"),
-        client_order_id="test_disconnected_order",
+        price=Decimal("1"),
+        client_order_id="bad-symbol",
     )
 
-    with pytest.raises(ConnectionError, match="CTP gateway not connected"):
-        await ctp_adapter.submit_order(spec)
+    with pytest.raises(ValueError, match="Unknown exchange"):
+        await adapter.submit_order(spec)
+

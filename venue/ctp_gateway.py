@@ -1,133 +1,152 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
-import os
-from typing import Optional
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable
+
+import vnpy.trader.utility as trader_utility
+
+from vnpy.trader.event import (
+    EVENT_ACCOUNT,
+    EVENT_LOG,
+    EVENT_ORDER,
+    EVENT_POSITION,
+    EVENT_TICK,
+    EVENT_TRADE,
+)
+from vnpy.trader.object import (
+    AccountData,
+    CancelRequest,
+    OrderData,
+    OrderRequest,
+    PositionData,
+    SubscribeRequest,
+    TickData,
+    TradeData,
+)
+
+from venue.ctp_utils import account_to_snapshot, build_ctp_runtime_config, build_vnpy_setting
+
+if TYPE_CHECKING:
+    from core.state_writer import StateWriter
 
 logger = logging.getLogger(__name__)
 
-# vnpy 事件类型常量
-EVENT_LOG     = "eLog"
-EVENT_ACCOUNT = "eAccount."
-
 
 class CtpGatewayWrapper:
-    """封装 vnpy_ctp.CtpGateway，管理连接生命周期。"""
+    """Async wrapper around the current vnpy_ctp gateway and event engine."""
 
-    def __init__(self, config: dict) -> None:
-        self.broker_id: str  = config["broker_id"]
-        self.user_id: str    = config.get("user_id")   or os.getenv("CTP_USER_ID", "")
-        self.password: str   = config.get("password")  or os.getenv("CTP_PASSWORD", "")
-        self.app_id: str     = config["app_id"]
-        self.auth_code: str  = config.get("auth_code") or os.getenv("CTP_AUTH_CODE", "")
-        # 兼容 front_addr 与 ctp_front_addr 两种 key
-        self.front_addr: str = config.get("front_addr") or config.get("ctp_front_addr", "")
+    def __init__(self, config: dict, state_writer: StateWriter | None = None) -> None:
+        self._runtime_config = build_ctp_runtime_config(config)
+        self._setting = build_vnpy_setting(config)
+        self._state_writer = state_writer
 
-        self._event_engine  = None   # vnpy EventEngine
-        self._gateway       = None   # vnpy CtpGateway
-        self._connected: bool               = False
-        self._login_event: asyncio.Event    = asyncio.Event()
-        self._login_error: Optional[str]    = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._reconnect_task: Optional[asyncio.Task]    = None
-        self._should_reconnect: bool = True
+        self.broker_id = self._runtime_config["broker_id"]
+        self.user_id = self._runtime_config["user_id"]
+        self.password = self._runtime_config["password"]
+        self.app_id = self._runtime_config["app_id"]
+        self.auth_code = self._runtime_config["auth_code"]
+        self.td_front_addr = self._runtime_config["ctp_td_front_addr"]
+        self.md_front_addr = self._runtime_config["ctp_md_front_addr"]
+        self.counter_env = self._runtime_config["ctp_counter_env"]
+
+        self._event_engine = None
+        self._gateway = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+        self._connected = False
+        self._login_event = asyncio.Event()
+        self._account_event = asyncio.Event()
+        self._position_event = asyncio.Event()
+        self._login_error: str | None = None
+        self._auth_warning: str | None = None
+        self._should_reconnect = True
+        self._reconnect_task: asyncio.Task | None = None
+
+        self._last_account: AccountData | None = None
+        self._positions: dict[str, PositionData] = {}
+        self._last_position_monotonic: float = 0.0
+
+        self._order_listeners: list[Callable[[OrderData], Any]] = []
+        self._trade_listeners: list[Callable[[TradeData], Any]] = []
+        self._tick_listeners: list[Callable[[TickData], Any]] = []
+        self._account_listeners: list[Callable[[AccountData], Any]] = []
+        self._position_listeners: list[Callable[[PositionData], Any]] = []
+        self._subscriptions: dict[str, SubscribeRequest] = {}
 
     @property
     def is_connected(self) -> bool:
         return self._connected
 
-    # ── vnpy 要求的中文设置字典 ───────────────────────────────────────
-    def _build_setting(self) -> dict:
-        return {
-            "用户名":   self.user_id,
-            "密码":     self.password,
-            "经纪商代码": self.broker_id,
-            "交易服务器": self.front_addr,
-            "行情服务器": self.front_addr,   # SimNow TD/MD 同地址
-            "产品名称": self.app_id,
-            "授权编码": self.auth_code,
-            "产品信息": "",
-        }
+    def register_order_listener(self, callback: Callable[[OrderData], Any]) -> None:
+        self._order_listeners.append(callback)
 
-    # ── 事件回调（运行在 EventEngine 线程，需 call_soon_threadsafe）──
-    def _on_log(self, event) -> None:
-        log = event.data
-        msg: str = getattr(log, "msg", str(log))
-        logger.debug(f"[CTP] {msg}")
+    def register_trade_listener(self, callback: Callable[[TradeData], Any]) -> None:
+        self._trade_listeners.append(callback)
 
-        if self._login_event.is_set():
-            return
+    def register_tick_listener(self, callback: Callable[[TickData], Any]) -> None:
+        self._tick_listeners.append(callback)
 
-        # 登录成功关键词（vnpy_ctp 源码固定输出）
-        if "交易服务器登录成功" in msg:
-            self._connected = True
-            self._safe_set_event()
-        # 登录失败关键词
-        elif any(k in msg for k in ["登录失败", "密码错误", "AuthCode", "认证失败", "ErrorID"]):
-            self._login_error = f"CTP 登录失败: {msg}"
-            self._safe_set_event()
+    def register_account_listener(self, callback: Callable[[AccountData], Any]) -> None:
+        self._account_listeners.append(callback)
 
-    def _on_account(self, event) -> None:
-        """收到账户信息表示登录成功。"""
-        if not self._connected:
-            self._connected = True
-        if not self._login_event.is_set():
-            self._safe_set_event()
+    def register_position_listener(self, callback: Callable[[PositionData], Any]) -> None:
+        self._position_listeners.append(callback)
 
-    def _safe_set_event(self) -> None:
-        """线程安全地唤醒 asyncio.Event。"""
-        if self._loop and not self._loop.is_closed():
-            self._loop.call_soon_threadsafe(self._login_event.set)
-
-    # ── 公共接口 ────────────────────────────────────────────────────────────
-    async def connect(self) -> None:
+    async def connect(self, timeout: float = 30.0) -> None:
         if self._connected:
-            logger.info("CTP 已连接")
             return
 
         from vnpy.event import EventEngine
         from vnpy_ctp.gateway import CtpGateway
 
-        logger.info(
-            f"[CTP] 连接 broker={self.broker_id} user={self.user_id} addr={self.front_addr}"
-        )
-
-        self._loop = asyncio.get_event_loop()
-        self._login_event.clear()
-        self._login_error = None
-        self._connected   = False
+        self._loop = asyncio.get_running_loop()
         self._should_reconnect = True
+        self._login_error = None
+        self._auth_warning = None
+        self._login_event.clear()
+        self._account_event.clear()
+        self._position_event.clear()
 
-        # 创建 EventEngine 并启动
-        self._event_engine = EventEngine()
-        self._event_engine.register(EVENT_LOG,     self._on_log)
-        self._event_engine.register(EVENT_ACCOUNT, self._on_account)
-        self._event_engine.start()
+        if self._event_engine is None:
+            self._event_engine = EventEngine()
+            self._event_engine.register(EVENT_LOG, self._on_log)
+            self._event_engine.register(EVENT_ACCOUNT, self._on_account)
+            self._event_engine.register(EVENT_POSITION, self._on_position)
+            self._event_engine.register(EVENT_ORDER, self._on_order)
+            self._event_engine.register(EVENT_TRADE, self._on_trade)
+            self._event_engine.register(EVENT_TICK, self._on_tick)
+            self._event_engine.start()
 
-        # 创建并连接 CtpGateway
-        self._gateway = CtpGateway(self._event_engine, "CTP")
-        self._gateway.connect(self._build_setting())
+        self._prepare_vnpy_runtime()
 
-        # 等待登录完成（最多 30 秒）
+        if self._gateway is None:
+            self._gateway = CtpGateway(self._event_engine, "CTP")
+
+        await self._write_connection_status("CONNECTING", detail=self._describe_fronts())
+        self._gateway.connect(dict(self._setting))
+
         try:
-            await asyncio.wait_for(self._login_event.wait(), timeout=30.0)
-        except asyncio.TimeoutError:
-            raise TimeoutError(
-                "CTP 登录超时（>30s）——请检查网络或前置地址是否可达"
+            await asyncio.wait_for(self._login_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            await self._write_connection_status(
+                "LOGIN_FAILED",
+                detail=f"CTP login timeout after {timeout:.0f}s",
             )
+            raise TimeoutError("CTP login timeout") from exc
 
         if self._login_error:
+            await self._write_connection_status("LOGIN_FAILED", detail=self._login_error)
             raise ConnectionError(self._login_error)
-
-        logger.info("[CTP] 登录成功")
 
         if self._reconnect_task is None or self._reconnect_task.done():
             self._reconnect_task = asyncio.create_task(self._reconnect_loop())
 
     async def disconnect(self) -> None:
         self._should_reconnect = False
-
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
             try:
@@ -135,21 +154,177 @@ class CtpGatewayWrapper:
             except asyncio.CancelledError:
                 pass
 
-        if self._gateway:
+        if self._gateway is not None:
             try:
                 self._gateway.close()
-            except Exception as e:
-                logger.warning(f"[CTP] 关闭网关异常: {e}")
+            except Exception as exc:  # pragma: no cover
+                logger.warning("Error closing CTP gateway: %s", exc)
 
-        if self._event_engine:
+        if self._event_engine is not None:
             try:
                 self._event_engine.stop()
-            except Exception as e:
-                logger.warning(f"[CTP] 停止EventEngine异常: {e}")
+            except Exception as exc:  # pragma: no cover
+                logger.warning("Error stopping EventEngine: %s", exc)
 
+        self._gateway = None
+        self._event_engine = None
         self._connected = False
         self._login_event.clear()
-        logger.info("[CTP] 已断开连接")
+        self._account_event.clear()
+        self._position_event.clear()
+        await self._write_connection_status("DISCONNECTED", detail="disconnect requested")
+
+    async def refresh_account(self, timeout: float = 10.0) -> AccountData:
+        if not self._connected or self._gateway is None:
+            raise ConnectionError("CTP gateway not connected")
+
+        self._account_event.clear()
+        self._gateway.query_account()
+        try:
+            await asyncio.wait_for(self._account_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError("Query account timeout") from exc
+
+        if self._last_account is None:
+            raise RuntimeError("CTP account query returned no data")
+        return self._last_account
+
+    async def refresh_positions(
+        self,
+        timeout: float = 10.0,
+        settle_delay: float = 0.3,
+    ) -> list[PositionData]:
+        if not self._connected or self._gateway is None:
+            raise ConnectionError("CTP gateway not connected")
+
+        self._positions = {}
+        self._last_position_monotonic = 0.0
+        self._position_event.clear()
+        self._gateway.query_position()
+
+        try:
+            await asyncio.wait_for(self._position_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError("Query positions timeout") from exc
+
+        last_seen = self._last_position_monotonic
+        while True:
+            await asyncio.sleep(settle_delay)
+            if self._last_position_monotonic == last_seen:
+                break
+            last_seen = self._last_position_monotonic
+
+        return list(self._positions.values())
+
+    def send_order(self, req: OrderRequest) -> str:
+        if not self._connected or self._gateway is None:
+            raise ConnectionError("CTP gateway not connected")
+        return self._gateway.send_order(req)
+
+    def cancel_order(self, req: CancelRequest) -> None:
+        if not self._connected or self._gateway is None:
+            raise ConnectionError("CTP gateway not connected")
+        self._gateway.cancel_order(req)
+
+    def subscribe(self, requests: list[SubscribeRequest]) -> None:
+        for request in requests:
+            self._subscriptions[self._subscription_key(request)] = request
+            if self._connected and self._gateway is not None:
+                self._gateway.subscribe(request)
+
+    def get_gateway(self):
+        if self._gateway is None:
+            raise RuntimeError("CTP gateway is not initialized")
+        return self._gateway
+
+    def _prepare_vnpy_runtime(self) -> Path:
+
+        runtime_temp = Path.cwd() / ".vntrader_runtime"
+        runtime_temp.mkdir(parents=True, exist_ok=True)
+        trader_utility.TEMP_DIR = runtime_temp
+        trader_utility.TRADER_DIR = Path.cwd()
+        try:
+            import vnpy_ctp.gateway.ctp_gateway as ctp_gateway_module
+        except ModuleNotFoundError:
+            ctp_gateway_module = None
+        if ctp_gateway_module is not None:
+            ctp_gateway_module.get_folder_path = trader_utility.get_folder_path
+
+        flow_root = trader_utility.get_folder_path("ctp")
+        flow_root.joinpath("Td").mkdir(parents=True, exist_ok=True)
+        flow_root.joinpath("Md").mkdir(parents=True, exist_ok=True)
+        logger.info("Prepared vnpy runtime path: %s", flow_root)
+        return flow_root
+
+    def _on_log(self, event) -> None:
+        log = event.data
+        msg = getattr(log, "msg", str(log))
+        logger.info("[CTP] %s", msg)
+
+        lowered = msg.lower()
+        if "认证码错误" in msg and "豁免终端认证" in msg:
+            self._auth_warning = msg
+            self._schedule_task(self._write_connection_status("AUTH_WARNING", detail=msg))
+            return
+
+        if any(token in msg for token in ("不合法的登录", "登录失败", "认证失败")):
+            self._login_error = msg
+            self._signal(self._login_event)
+            return
+
+        if "shake hand err" in lowered or "decode err" in lowered:
+            self._login_error = msg
+            self._signal(self._login_event)
+            return
+
+        if "连接断开" in msg or "已断开" in msg:
+            if self._connected:
+                self._connected = False
+                self._login_event.clear()
+                self._schedule_task(self._write_connection_status("DISCONNECTED", detail=msg))
+            return
+
+    def _on_account(self, event) -> None:
+        account: AccountData = event.data
+        self._last_account = account
+        self._signal(self._account_event)
+
+        if not self._connected:
+            self._connected = True
+            self._signal(self._login_event)
+            detail = self._auth_warning or self._describe_fronts()
+            self._schedule_task(self._write_connection_status("CONNECTED", detail=detail))
+            self._resubscribe_all()
+
+        for callback in self._account_listeners:
+            self._dispatch_listener(callback, account)
+
+        self._schedule_task(self._write_account_snapshot(account))
+
+    def _on_position(self, event) -> None:
+        position: PositionData = event.data
+        self._positions[position.vt_positionid] = position
+        if self._loop is not None:
+            self._last_position_monotonic = self._loop.time()
+        self._signal(self._position_event)
+
+        for callback in self._position_listeners:
+            self._dispatch_listener(callback, position)
+
+    def _on_order(self, event) -> None:
+        order: OrderData = event.data
+        for callback in self._order_listeners:
+            self._dispatch_listener(callback, order)
+
+    def _on_trade(self, event) -> None:
+        trade: TradeData = event.data
+        for callback in self._trade_listeners:
+            self._dispatch_listener(callback, trade)
+
+    def _on_tick(self, event) -> None:
+        tick: TickData = event.data
+        for callback in self._tick_listeners:
+            self._dispatch_listener(callback, tick)
 
     async def _reconnect_loop(self) -> None:
         interval = 1.0
@@ -157,33 +332,79 @@ class CtpGatewayWrapper:
 
         while self._should_reconnect:
             await asyncio.sleep(interval)
-            if self._connected or not self._should_reconnect:
+            if self._connected or self._gateway is None:
                 interval = 1.0
                 continue
 
-            logger.info(f"[CTP] 尝试重连 (interval={interval:.0f}s)")
-            try:
-                self._login_event.clear()
-                self._login_error = None
-                if self._gateway:
-                    self._gateway.connect(self._build_setting())
-                    try:
-                        await asyncio.wait_for(self._login_event.wait(), timeout=30.0)
-                        if self._login_error:
-                            logger.warning(f"[CTP] 重连失败: {self._login_error}")
-                            interval = min(interval * 2, max_interval)
-                        else:
-                            self._connected = True
-                            interval = 1.0
-                            logger.info("[CTP] 重连成功")
-                    except asyncio.TimeoutError:
-                        logger.warning("[CTP] 重连超时")
-                        interval = min(interval * 2, max_interval)
-            except Exception as e:
-                logger.error(f"[CTP] 重连异常: {e}")
-                interval = min(interval * 2, max_interval)
+            await self._write_connection_status("RECONNECTING", detail=f"retry in {interval:.0f}s")
+            self._login_error = None
+            self._login_event.clear()
+            self._prepare_vnpy_runtime()
+            self._gateway.connect(dict(self._setting))
 
-    def get_gateway(self):
-        if self._gateway is None:
-            raise RuntimeError("CTP 网关未初始化")
-        return self._gateway
+            try:
+                await asyncio.wait_for(self._login_event.wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                interval = min(interval * 2, max_interval)
+                continue
+
+            if self._login_error:
+                await self._write_connection_status("LOGIN_FAILED", detail=self._login_error)
+                interval = min(interval * 2, max_interval)
+                continue
+
+            interval = 1.0
+
+    def _resubscribe_all(self) -> None:
+        if not self._connected or self._gateway is None:
+            return
+        for request in self._subscriptions.values():
+            self._gateway.subscribe(request)
+
+    def _dispatch_listener(self, callback: Callable[[Any], Any], data: Any) -> None:
+        def invoke() -> None:
+            result = callback(data)
+            if inspect.isawaitable(result):
+                asyncio.create_task(result)
+
+        if self._loop and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(invoke)
+
+    def _signal(self, event: asyncio.Event) -> None:
+        if self._loop and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(event.set)
+
+    def _schedule_task(self, coro: Any) -> None:
+        if self._loop and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(asyncio.create_task, coro)
+        elif inspect.iscoroutine(coro):
+            coro.close()
+
+    def _describe_fronts(self) -> str:
+        return f"td={self.td_front_addr}; md={self.md_front_addr}; env={self.counter_env}"
+
+    async def _write_connection_status(
+        self,
+        status: str,
+        detail: str | None = None,
+        session_id: str = "",
+    ) -> None:
+        if self._state_writer is None:
+            return
+        await self._state_writer.write_connection_log(
+            status=status,
+            front_addr=self.td_front_addr,
+            session_id=session_id,
+            detail=detail or "",
+        )
+
+    async def _write_account_snapshot(self, account: AccountData) -> None:
+        if self._state_writer is None:
+            return
+        snapshot = account_to_snapshot(account, self.user_id, self.broker_id)
+        await self._state_writer.write_account_info(**snapshot)
+
+    @staticmethod
+    def _subscription_key(request: SubscribeRequest) -> str:
+        return f"{request.symbol}.{request.exchange.value}"
+

@@ -42,6 +42,8 @@ class MockVenueAdapter(VenueAdapter):
         # internal state
         self._spec_by_client_id: Dict[str, VenueOrderSpec] = {}
         self._exchange_id_by_client_id: Dict[str, str] = {}
+        self._status_by_client_id: Dict[str, str] = {}
+        self.canceled_order_ids: List[str] = []
 
     async def submit_order(self, spec: VenueOrderSpec) -> VenueReceipt:
         await asyncio.sleep(0)
@@ -82,6 +84,7 @@ class MockVenueAdapter(VenueAdapter):
             self.submitted_orders.append(spec)
             self._spec_by_client_id[spec.client_order_id] = spec
             self._exchange_id_by_client_id[spec.client_order_id] = exchange_order_id
+            self._status_by_client_id[spec.client_order_id] = "REJECTED"
             return receipt
 
         # normal success
@@ -105,6 +108,7 @@ class MockVenueAdapter(VenueAdapter):
         self.submitted_orders.append(spec)
         self._spec_by_client_id[spec.client_order_id] = spec
         self._exchange_id_by_client_id[spec.client_order_id] = exchange_order_id
+        self._status_by_client_id[spec.client_order_id] = "SENT"
         return receipt
 
     async def cancel_order(self, client_order_id: str) -> VenueReceipt:
@@ -112,6 +116,8 @@ class MockVenueAdapter(VenueAdapter):
 
         now = datetime.now(timezone.utc)
         exchange_order_id = self._exchange_id_by_client_id.get(client_order_id, f"MOCK-CANCEL-{uuid4()}")
+        self._status_by_client_id[client_order_id] = "CANCELED"
+        self.canceled_order_ids.append(client_order_id)
         return VenueReceipt(
             client_order_id=client_order_id,
             exchange_order_id=exchange_order_id,
@@ -130,20 +136,40 @@ class MockVenueAdapter(VenueAdapter):
         now = datetime.now(timezone.utc)
         spec = self._spec_by_client_id.get(client_order_id)
         exchange_order_id = self._exchange_id_by_client_id.get(client_order_id, f"MOCK-QUERY-{uuid4()}")
+        current_status = self._status_by_client_id.get(client_order_id, "NOT_FOUND")
 
-        # simulate immediate fill
-        filled_qty = spec.quantity if spec is not None else Decimal("0")
-        # if MARKET has None price, keep filled_price as 0 for determinism
-        filled_px = (
-            spec.price
-            if (spec is not None and spec.price is not None)
-            else Decimal("0")
-        )
+        if spec is None and current_status == "NOT_FOUND":
+            return VenueOrderStatus(
+                client_order_id=client_order_id,
+                exchange_order_id=exchange_order_id,
+                status="NOT_FOUND",
+                filled_quantity=Decimal("0"),
+                filled_price=Decimal("0"),
+                updated_at=now,
+            )
+
+        if current_status == "REJECTED":
+            filled_qty = Decimal("0")
+            filled_px = Decimal("0")
+        elif current_status == "CANCELED":
+            filled_qty = Decimal("0")
+            filled_px = Decimal("0")
+        else:
+            # simulate immediate fill for accepted orders
+            filled_qty = spec.quantity if spec is not None else Decimal("0")
+            # if MARKET has None price, keep filled_price as 0 for determinism
+            filled_px = (
+                spec.price
+                if (spec is not None and spec.price is not None)
+                else Decimal("0")
+            )
+            current_status = "FILLED"
+            self._status_by_client_id[client_order_id] = current_status
 
         return VenueOrderStatus(
             client_order_id=client_order_id,
             exchange_order_id=exchange_order_id,
-            status="FILLED",
+            status=current_status,
             filled_quantity=filled_qty,
             filled_price=filled_px,
             updated_at=now,

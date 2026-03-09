@@ -195,3 +195,204 @@ CREATE TABLE IF NOT EXISTS account_info (
 
 CREATE INDEX IF NOT EXISTS idx_account_info_ts
     ON account_info(ts);
+
+-- ============================================
+-- Issue #9 Upgrade: ChatOps Raw Messages
+-- ============================================
+CREATE TABLE IF NOT EXISTS chat_messages (
+    message_id           TEXT PRIMARY KEY,
+    channel              TEXT NOT NULL,
+    thread_id            TEXT,
+    author_kind          TEXT NOT NULL DEFAULT 'system',
+    sender_id            TEXT,
+    agent_role           TEXT,
+    message_type         TEXT NOT NULL DEFAULT 'plain',
+    visibility           TEXT NOT NULL DEFAULT 'channel',
+    task_id              TEXT,
+    workflow_run_id      TEXT,
+    content              TEXT NOT NULL,
+    payload_json         TEXT,
+    created_at           TEXT NOT NULL,
+    trading_day          TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_messages_channel_created
+    ON chat_messages(channel, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_chat_messages_trading_day
+    ON chat_messages(trading_day, created_at);
+
+-- ============================================
+-- Issue #9 Upgrade: Tasks
+-- ============================================
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id                  TEXT PRIMARY KEY,
+    source_type              TEXT NOT NULL,
+    source_message_id        TEXT,
+    target_role              TEXT NOT NULL,
+    intent_type              TEXT NOT NULL,
+    workflow_type            TEXT NOT NULL,
+    status                   TEXT NOT NULL,
+    priority                 TEXT NOT NULL DEFAULT 'NORMAL',
+    preemptible              INTEGER NOT NULL DEFAULT 1,
+    requires_approval        INTEGER NOT NULL DEFAULT 0,
+    visibility               TEXT NOT NULL DEFAULT 'channel',
+    system_mode              TEXT NOT NULL DEFAULT 'NORMAL',
+    parent_task_id           TEXT,
+    superseded_by_task_id    TEXT,
+    created_by               TEXT,
+    arguments_json           TEXT,
+    created_at               TEXT NOT NULL,
+    updated_at               TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_status_priority
+    ON tasks(status, priority, updated_at);
+
+-- ============================================
+-- Issue #9 Upgrade: Workflow Runs
+-- ============================================
+CREATE TABLE IF NOT EXISTS workflow_runs (
+    workflow_run_id          TEXT PRIMARY KEY,
+    task_id                  TEXT NOT NULL,
+    workflow_type            TEXT NOT NULL,
+    workflow_class           TEXT NOT NULL,
+    status                   TEXT NOT NULL,
+    trigger_type             TEXT NOT NULL,
+    priority                 TEXT NOT NULL DEFAULT 'NORMAL',
+    preempted_by_run_id      TEXT,
+    resume_token             TEXT,
+    deadline_at              TEXT,
+    summary_json             TEXT,
+    error_text               TEXT,
+    started_at               TEXT NOT NULL,
+    finished_at              TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_task
+    ON workflow_runs(task_id, started_at);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_status_priority
+    ON workflow_runs(status, priority, started_at);
+
+-- ============================================
+-- Issue #9 Upgrade: Workflow Steps
+-- ============================================
+CREATE TABLE IF NOT EXISTS workflow_steps (
+    step_id                  TEXT PRIMARY KEY,
+    workflow_run_id          TEXT NOT NULL,
+    step_order               INTEGER NOT NULL,
+    step_role                TEXT NOT NULL,
+    step_type                TEXT NOT NULL,
+    status                   TEXT NOT NULL,
+    input_json               TEXT,
+    output_json              TEXT,
+    started_at               TEXT NOT NULL,
+    finished_at              TEXT,
+    error_text               TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_steps_run
+    ON workflow_steps(workflow_run_id, step_order);
+
+-- ============================================
+-- Issue #9 Upgrade: Approval Requests
+-- ============================================
+CREATE TABLE IF NOT EXISTS approval_requests (
+    approval_id              TEXT PRIMARY KEY,
+    task_id                  TEXT NOT NULL,
+    workflow_run_id          TEXT NOT NULL,
+    approval_type            TEXT NOT NULL,
+    status                   TEXT NOT NULL,
+    requested_action         TEXT NOT NULL,
+    instrument               TEXT,
+    position_delta           REAL DEFAULT 0,
+    risk_level               TEXT NOT NULL DEFAULT 'medium',
+    expires_at               TEXT,
+    superseded_by            TEXT,
+    market_snapshot_id       TEXT,
+    risk_snapshot_id         TEXT,
+    request_hash             TEXT NOT NULL,
+    resolved_by              TEXT,
+    resolved_at              TEXT,
+    resolution_note          TEXT,
+    created_at               TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_request_hash
+    ON approval_requests(request_hash);
+
+CREATE INDEX IF NOT EXISTS idx_approval_status_expires
+    ON approval_requests(status, expires_at);
+
+-- ============================================
+-- Issue #9 Upgrade: Scheduled Jobs
+-- ============================================
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+    job_id                   TEXT PRIMARY KEY,
+    job_type                 TEXT NOT NULL,
+    schedule_kind            TEXT NOT NULL,
+    schedule_expr            TEXT NOT NULL,
+    enabled                  INTEGER NOT NULL DEFAULT 1,
+    last_run_at              TEXT,
+    next_run_at              TEXT,
+    payload_json             TEXT
+);
+
+-- ============================================
+-- Issue #9 Upgrade: Agent Capabilities
+-- ============================================
+CREATE TABLE IF NOT EXISTS agent_capabilities (
+    agent_name                   TEXT PRIMARY KEY,
+    provider                     TEXT,
+    allowed_workflows            TEXT NOT NULL,
+    can_read_market_data         INTEGER NOT NULL DEFAULT 0,
+    can_read_positions           INTEGER NOT NULL DEFAULT 0,
+    can_read_logs                INTEGER NOT NULL DEFAULT 0,
+    can_generate_trade_advice    INTEGER NOT NULL DEFAULT 0,
+    can_request_approval         INTEGER NOT NULL DEFAULT 0,
+    can_trigger_execution        INTEGER NOT NULL DEFAULT 0,
+    can_force_protective_action  INTEGER NOT NULL DEFAULT 0,
+    requires_structured_input    INTEGER NOT NULL DEFAULT 0,
+    supports_natural_language    INTEGER NOT NULL DEFAULT 1,
+    fallback_provider            TEXT,
+    enabled                      INTEGER NOT NULL DEFAULT 1
+);
+
+-- ============================================
+-- Issue #9 Upgrade: Daily Fact Snapshots
+-- ============================================
+CREATE TABLE IF NOT EXISTS daily_fact_snapshots (
+    snapshot_id                  TEXT PRIMARY KEY,
+    trading_day                  TEXT NOT NULL UNIQUE,
+    instrument_stats_json        TEXT NOT NULL,
+    decision_counts_json         TEXT NOT NULL,
+    risk_event_counts_json       TEXT NOT NULL,
+    approval_stats_json          TEXT NOT NULL,
+    execution_stats_json         TEXT NOT NULL,
+    reconciliation_stats_json    TEXT NOT NULL,
+    portfolio_exposure_json      TEXT NOT NULL,
+    incident_flags_json          TEXT NOT NULL,
+    workflow_stats_json          TEXT NOT NULL,
+    fallback_stats_json          TEXT NOT NULL,
+    schema_version               TEXT NOT NULL,
+    generator_version            TEXT NOT NULL,
+    checksum                     TEXT,
+    generated_at                 TEXT NOT NULL
+);
+
+-- ============================================
+-- Issue #9 Upgrade: Daily Summaries
+-- ============================================
+CREATE TABLE IF NOT EXISTS daily_summaries (
+    summary_id                   TEXT PRIMARY KEY,
+    trading_day                  TEXT NOT NULL UNIQUE,
+    runtime_path                 TEXT,
+    knowledge_path               TEXT,
+    status                       TEXT NOT NULL,
+    headline                     TEXT NOT NULL,
+    summary_json                 TEXT NOT NULL,
+    generated_at                 TEXT NOT NULL,
+    source_window_start          TEXT,
+    source_window_end            TEXT
+);

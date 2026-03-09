@@ -1,488 +1,214 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+from vnpy.trader.constant import Direction, Exchange
+from vnpy.trader.object import CancelRequest, OrderData, OrderRequest, PositionData, SubscribeRequest, TradeData
+
+from core.state_schema import OrderSide, OrderState, OrderStatus, PositionState
+from core.venue_order_spec import VenueOrderSpec, VenueOrderStatus, VenuePosition, VenueReceipt
+from venue.base import MarketStatus as BaseMarketStatus
+from venue.ctp_gateway import CtpGatewayWrapper
+from venue.ctp_utils import (
+    load_instrument_exchange_map,
+    order_type_to_vnpy,
+    position_to_side,
+    reduce_only_to_offset,
+    side_to_direction,
+    status_to_receipt,
+)
 
 if TYPE_CHECKING:
     from core.state_writer import StateWriter
-
-from core.venue_order_spec import VenueOrderSpec, VenueOrderStatus, VenuePosition, VenueReceipt
-from venue.base import MarketStatus as BaseMarketStatus
-from venue.ctp_callback_handler import CtpCallbackHandler
-from venue.ctp_gateway import CtpGatewayWrapper
+    from vnpy.trader.object import AccountData
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class VenueAccountInfo:
-    """Account balance and margin information from CTP."""
-
     account_id: str
     broker_id: str
-    balance: Decimal           # 动态权益
-    available: Decimal         # 可用资金
-    margin: Decimal            # 占用保证金
-    frozen_margin: Decimal     # 冻结保证金
-    frozen_cash: Decimal       # 冻结资金（手续费等）
-    profit_loss: Decimal       # 盯市盈亏
-    commission: Decimal        # 当日手续费
+    balance: Decimal
+    available: Decimal
+    margin: Decimal
+    frozen_margin: Decimal
+    frozen_cash: Decimal
+    profit_loss: Decimal
+    commission: Decimal
     updated_at: datetime
 
 
 class CTPAdapter:
-    """CTP adapter using vnpy_ctp to connect to SimNow trading environment."""
+    """CTP adapter backed by the current vnpy_ctp gateway objects."""
 
-    def __init__(self, config: dict, state_writer: StateWriter | None = None) -> None:
-        """Initialize CTP adapter with configuration.
-
-        Args:
-            config: Dictionary containing CTP connection parameters.
-            state_writer: Optional StateWriter for persisting order/position state.
-        """
+    def __init__(
+        self,
+        config: dict,
+        state_writer: StateWriter | None = None,
+        gateway_wrapper: CtpGatewayWrapper | None = None,
+        instrument_config_path: Path | None = None,
+    ) -> None:
         self._config = config
         self._state_writer = state_writer
+        self._gateway = gateway_wrapper or CtpGatewayWrapper(config, state_writer=state_writer)
+        self._instrument_exchange = load_instrument_exchange_map(instrument_config_path)
 
-        self._gateway = CtpGatewayWrapper(config)
+        self._gateway.register_order_listener(self._on_order_event)
+        self._gateway.register_trade_listener(self._on_trade_event)
 
-        # Create callback handler immediately (no gateway interaction needed)
-        self._callback_handler = CtpCallbackHandler(
-            on_order_update=self._on_order_update,
-            on_trade_update=self._on_trade_update,
-        )
-
-        self._order_futures: dict[str, asyncio.Future[VenueReceipt]] = {}
+        self._pending_futures: dict[str, asyncio.Future[VenueReceipt]] = {}
         self._submitted_orders: set[str] = set()
+        self._order_status_by_client_id: dict[str, VenueOrderStatus] = {}
+        self._order_data_by_client_id: dict[str, OrderData] = {}
+        self._exchange_to_client_id: dict[str, str] = {}
+        self._client_order_specs: dict[str, VenueOrderSpec] = {}
+        self._created_at_by_client_id: dict[str, datetime] = {}
 
-        self.submit_count: int = 0
-        self.cancel_count: int = 0
-        # Note: _setup_callbacks() is NOT called here.
-        # Gateway callbacks are registered in connect() after the
-        # underlying CtpGateway object is initialized.
+        self.submit_count = 0
+        self.cancel_count = 0
 
-    def _setup_callbacks(self) -> None:
-        """Register CTP callback handlers on the live gateway.
-
-        Must be called AFTER connect() because get_gateway() requires
-        the underlying CtpGateway to be initialized.
-        """
-        gateway = self._gateway.get_gateway()
-        if hasattr(gateway, "on_rtn_order"):
-            gateway.on_rtn_order = self._callback_handler.on_rtn_order
-        if hasattr(gateway, "on_rtn_trade"):
-            gateway.on_rtn_trade = self._callback_handler.on_rtn_trade
-        if hasattr(gateway, "on_err_rtn_order_insert"):
-            gateway.on_err_rtn_order_insert = self._callback_handler.on_err_rtn_order_insert
-        if hasattr(gateway, "on_err_rtn_order_action"):
-            gateway.on_err_rtn_order_action = self._callback_handler.on_err_rtn_order_action
+    @property
+    def gateway_wrapper(self) -> CtpGatewayWrapper:
+        return self._gateway
 
     async def connect(self) -> None:
-        """Connect to CTP gateway and register callbacks."""
         await self._gateway.connect()
-        self._setup_callbacks()
 
     async def disconnect(self) -> None:
-        """Disconnect from CTP gateway."""
         await self._gateway.disconnect()
 
     async def submit_order(self, spec: VenueOrderSpec) -> VenueReceipt:
-        """Submit an order to CTP.
-
-        Args:
-            spec: VenueOrderSpec with order details.
-
-        Returns:
-            VenueReceipt with order acknowledgment.
-
-        Raises:
-            ConnectionError: If gateway is not connected.
-            TimeoutError: If order submission times out after 10 seconds.
-        """
         if not self._gateway.is_connected:
             raise ConnectionError("CTP gateway not connected")
-
         if spec.client_order_id in self._submitted_orders:
-            now = datetime.now(timezone.utc)
-            receipt = VenueReceipt(
+            return VenueReceipt(
                 client_order_id=spec.client_order_id,
                 exchange_order_id="",
                 status="REJECTED",
                 raw_response={"error": "Duplicate client_order_id"},
-                timestamp=now,
+                timestamp=datetime.now(timezone.utc),
             )
-            return receipt
 
-        self.submit_count += 1
+        exchange = self._resolve_exchange(spec.symbol)
+        request = OrderRequest(
+            symbol=spec.symbol,
+            exchange=exchange,
+            direction=side_to_direction(spec.side),
+            type=order_type_to_vnpy(spec.order_type, spec.time_in_force),
+            volume=float(spec.quantity),
+            price=float(spec.price or Decimal("0")),
+            offset=reduce_only_to_offset(spec.reduce_only),
+            reference=spec.client_order_id,
+        )
+
+        future: asyncio.Future[VenueReceipt] = asyncio.get_running_loop().create_future()
+        self._pending_futures[spec.client_order_id] = future
         self._submitted_orders.add(spec.client_order_id)
+        self._client_order_specs[spec.client_order_id] = spec
+        self._created_at_by_client_id.setdefault(spec.client_order_id, datetime.now(timezone.utc))
+        self.submit_count += 1
 
-        future: asyncio.Future[VenueReceipt] = asyncio.Future()
-        self._order_futures[spec.client_order_id] = future
+        order_id = self._gateway.send_order(request)
+        if order_id:
+            self._exchange_to_client_id[order_id] = spec.client_order_id
 
         try:
-            gateway = self._gateway.get_gateway()
-
-            req = {
-                "InstrumentID": spec.symbol,
-                "OrderRef": spec.client_order_id,
-                "Direction": CtpCallbackHandler.map_side(spec.side),
-                "OffsetFlag": CtpCallbackHandler.map_offset_flag(spec.reduce_only),
-                "HedgeFlag": CtpCallbackHandler.map_hedge_flag(spec.hedge_flag),
-                "VolumeTotalOriginal": int(spec.quantity),
-            }
-
-            if spec.order_type == "LIMIT" and spec.price is not None:
-                req["LimitPrice"] = float(spec.price)
-                req["OrderPriceType"] = "2"
-            elif spec.order_type == "MARKET":
-                req["OrderPriceType"] = "1"
-            elif spec.order_type == "STOP":
-                req["OrderPriceType"] = "3"
-                if spec.price is not None:
-                    req["StopPrice"] = float(spec.price)
-
-            if spec.time_in_force == "IOC":
-                req["TimeCondition"] = "3"
-            elif spec.time_in_force == "FOK":
-                req["TimeCondition"] = "4"
-            else:
-                req["TimeCondition"] = "1"
-
-            gateway.send_order(req, reqid=1)
-
-            try:
-                receipt = await asyncio.wait_for(future, timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.error(f"Order submission timeout: {spec.client_order_id}")
-                raise TimeoutError(f"Order submission timeout: {spec.client_order_id}")
-
-            if self._state_writer:
-                from core.state_schema import OrderState
-
-                order_state = OrderState(
-                    order_id=receipt.exchange_order_id or spec.client_order_id,
-                    client_order_id=spec.client_order_id,
-                    symbol=spec.symbol,
-                    venue="CTP",
-                    side=spec.side,
-                    quantity=str(spec.quantity),
-                    price=str(spec.price) if spec.price else None,
-                    status=receipt.status,
-                    strategy_id="",
-                    created_at=datetime.now(timezone.utc).isoformat(),
-                    updated_at=receipt.timestamp.isoformat(),
-                    filled_quantity="0",
-                    filled_price="0",
-                )
-                await self._state_writer.write_order(order_state)
-
-            return receipt
-
-        except Exception as e:
-            logger.error(f"Error submitting order: {e}", exc_info=True)
-            raise
+            return await asyncio.wait_for(future, timeout=10.0)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(f"Order submission timeout: {spec.client_order_id}") from exc
         finally:
-            self._order_futures.pop(spec.client_order_id, None)
+            self._pending_futures.pop(spec.client_order_id, None)
 
     async def cancel_order(self, client_order_id: str) -> VenueReceipt:
-        """Cancel an order by client_order_id.
-
-        Args:
-            client_order_id: Client-side order identifier.
-
-        Returns:
-            VenueReceipt with cancel acknowledgment.
-
-        Raises:
-            ConnectionError: If gateway is not connected.
-            TimeoutError: If cancel request times out after 10 seconds.
-        """
         if not self._gateway.is_connected:
             raise ConnectionError("CTP gateway not connected")
 
+        order = self._order_data_by_client_id.get(client_order_id)
+        if order is None:
+            raise LookupError(f"Cannot cancel unknown client_order_id: {client_order_id}")
+
+        future: asyncio.Future[VenueReceipt] = asyncio.get_running_loop().create_future()
+        self._pending_futures[client_order_id] = future
         self.cancel_count += 1
 
-        future: asyncio.Future[VenueReceipt] = asyncio.Future()
-        self._order_futures[client_order_id] = future
+        request = CancelRequest(
+            orderid=order.orderid,
+            symbol=order.symbol,
+            exchange=order.exchange,
+        )
+        self._gateway.cancel_order(request)
 
         try:
-            gateway = self._gateway.get_gateway()
-
-            req = {
-                "OrderRef": client_order_id,
-                "ActionFlag": "0",
-            }
-
-            gateway.cancel_order(req, reqid=2)
-
-            try:
-                receipt = await asyncio.wait_for(future, timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.error(f"Cancel order timeout: {client_order_id}")
-                raise TimeoutError(f"Cancel order timeout: {client_order_id}")
-
-            return receipt
-
-        except Exception as e:
-            logger.error(f"Error canceling order: {e}", exc_info=True)
-            raise
+            return await asyncio.wait_for(future, timeout=10.0)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(f"Cancel order timeout: {client_order_id}") from exc
         finally:
-            self._order_futures.pop(client_order_id, None)
+            self._pending_futures.pop(client_order_id, None)
 
     async def query_order(self, client_order_id: str) -> VenueOrderStatus:
-        """Query order status from CTP.
-
-        Args:
-            client_order_id: Client-side order identifier.
-
-        Returns:
-            VenueOrderStatus with current order state.
-        """
-        if not self._gateway.is_connected:
-            raise ConnectionError("CTP gateway not connected")
-
-        gateway = self._gateway.get_gateway()
-
-        req = {
-            "OrderRef": client_order_id,
-        }
-
-        query_future: asyncio.Future[dict] = asyncio.Future()
-
-        def on_rsp_qry_order(data: dict, error: dict | None, reqid: int, last: bool) -> None:
-            if not query_future.done():
-                if error and error.get("ErrorID", 0) != 0:
-                    query_future.set_exception(
-                        Exception(f"Query order failed: {error.get('ErrorMsg', 'Unknown error')}")
-                    )
-                else:
-                    query_future.set_result(data or {})
-
-        if hasattr(gateway, "on_rsp_qry_order"):
-            original_handler = gateway.on_rsp_qry_order
-            gateway.on_rsp_qry_order = on_rsp_qry_order
-
-        try:
-            gateway.query_order(req, reqid=3)
-
-            try:
-                data = await asyncio.wait_for(query_future, timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.error(f"Query order timeout: {client_order_id}")
-                raise TimeoutError(f"Query order timeout: {client_order_id}")
-
-            order_sys_id = data.get("OrderSysID", "")
-            status = data.get("OrderStatus", "")
-            volume_traded = data.get("VolumeTraded", "0")
-            avg_price = data.get("AvgPrice", "0")
-
-            ctp_status = self._callback_handler._map_ctp_status(status)
-
-            from core.venue_order_spec import VenueOrderStatus
-
-            return VenueOrderStatus(
-                client_order_id=client_order_id,
-                exchange_order_id=order_sys_id,
-                status=ctp_status,
-                filled_quantity=Decimal(str(volume_traded)),
-                filled_price=Decimal(str(avg_price)) if avg_price else Decimal("0"),
-                updated_at=datetime.now(timezone.utc),
+        status = self._order_status_by_client_id.get(client_order_id)
+        if status is None:
+            raise LookupError(
+                f"Remote single-order query is not supported by vnpy_ctp; no cached status for {client_order_id}"
             )
-
-        finally:
-            if hasattr(gateway, "on_rsp_qry_order") and 'original_handler' in locals():
-                gateway.on_rsp_qry_order = original_handler
+        return status
 
     async def query_positions(self) -> list[VenuePosition]:
-        """Query current positions from CTP.
+        raw_positions = await self._gateway.refresh_positions()
+        positions: list[VenuePosition] = []
+        state_positions: list[PositionState] = []
 
-        Returns:
-            List of VenuePosition objects.
-        """
-        if not self._gateway.is_connected:
-            raise ConnectionError("CTP gateway not connected")
-
-        gateway = self._gateway.get_gateway()
-
-        req = {}
-
-        query_future: asyncio.Future[list[dict]] = asyncio.Future()
-        positions_data: list[dict] = []
-
-        def on_rsp_qry_investor_position(data: dict, error: dict | None, reqid: int, last: bool) -> None:
-            if data:
-                positions_data.append(data)
-            if last and not query_future.done():
-                if error and error.get("ErrorID", 0) != 0:
-                    query_future.set_exception(
-                        Exception(f"Query positions failed: {error.get('ErrorMsg', 'Unknown error')}")
-                    )
-                else:
-                    query_future.set_result(positions_data.copy())
-
-        if hasattr(gateway, "on_rsp_qry_investor_position"):
-            original_handler = gateway.on_rsp_qry_investor_position
-            gateway.on_rsp_qry_investor_position = on_rsp_qry_investor_position
-
-        try:
-            gateway.query_position(req, reqid=4)
-
-            try:
-                data_list = await asyncio.wait_for(query_future, timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.error("Query positions timeout")
-                raise TimeoutError("Query positions timeout")
-
-            positions: list[VenuePosition] = []
-
-            for data in data_list:
-                symbol = data.get("InstrumentID", "")
-                if not symbol:
-                    continue
-
-                long_pos = Decimal(str(data.get("Position", "0")))
-                short_pos = Decimal(str(data.get("YdPosition", "0")))
-
-                net_long = long_pos - short_pos
-                net_short = short_pos - long_pos
-
-                if net_long > 0:
-                    entry_price = Decimal(str(data.get("OpenPrice", "0")))
-                    positions.append(
-                        VenuePosition(
-                            symbol=symbol,
-                            venue="CTP",
-                            side="LONG",
-                            quantity=net_long,
-                            entry_price=entry_price,
-                            unrealized_pnl=Decimal("0"),
-                            updated_at=datetime.now(timezone.utc),
-                        )
-                    )
-
-                if net_short > 0:
-                    entry_price = Decimal(str(data.get("OpenPrice", "0")))
-                    positions.append(
-                        VenuePosition(
-                            symbol=symbol,
-                            venue="CTP",
-                            side="SHORT",
-                            quantity=net_short,
-                            entry_price=entry_price,
-                            unrealized_pnl=Decimal("0"),
-                            updated_at=datetime.now(timezone.utc),
-                        )
-                    )
-
-            return positions
-
-        finally:
-            if hasattr(gateway, "on_rsp_qry_investor_position") and 'original_handler' in locals():
-                gateway.on_rsp_qry_investor_position = original_handler
-
-    async def query_account(self) -> VenueAccountInfo:
-        """Query account balance and margin info from CTP (ReqQryTradingAccount).
-
-        Returns:
-            VenueAccountInfo with balance, available funds, margin, and P&L.
-
-        Raises:
-            ConnectionError: If gateway is not connected.
-            TimeoutError: If query does not complete within 10 seconds.
-            Exception: If CTP returns an error response.
-        """
-        if not self._gateway.is_connected:
-            raise ConnectionError("CTP gateway not connected")
-
-        gateway = self._gateway.get_gateway()
-
-        query_future: asyncio.Future[dict] = asyncio.Future()
-
-        def on_rsp_qry_trading_account(
-            data: dict, error: dict | None, reqid: int, last: bool
-        ) -> None:
-            if not query_future.done():
-                if error and error.get("ErrorID", 0) != 0:
-                    from venue.ctp_error_codes import format_ctp_error
-                    error_id = error.get("ErrorID", 99)
-                    raw_msg = error.get("ErrorMsg", "")
-                    msg = format_ctp_error(error_id, raw_msg)
-                    query_future.set_exception(Exception(f"Query account failed: {msg}"))
-                else:
-                    query_future.set_result(data or {})
-
-        original_handler = None
-        if hasattr(gateway, "on_rsp_qry_trading_account"):
-            original_handler = gateway.on_rsp_qry_trading_account
-            gateway.on_rsp_qry_trading_account = on_rsp_qry_trading_account
-
-        try:
-            req = {
-                "BrokerID": self._config.get("broker_id", ""),
-                "InvestorID": self._config.get("user_id") or os.getenv("CTP_USER_ID", ""),
-                "CurrencyID": "CNY",
-            }
-            gateway.query_account(req, reqid=5)
-
-            try:
-                data = await asyncio.wait_for(query_future, timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.error("Query account timeout")
-                raise TimeoutError("Query account timeout")
-
-            account_id = data.get("AccountID", "")
-            broker_id = data.get("BrokerID", "")
-
-            def to_decimal(val: object) -> Decimal:
-                try:
-                    return Decimal(str(val)) if val not in (None, "", 0) else Decimal("0")
-                except Exception:
-                    return Decimal("0")
-
-            info = VenueAccountInfo(
-                account_id=account_id,
-                broker_id=broker_id,
-                balance=to_decimal(data.get("Balance")),
-                available=to_decimal(data.get("Available")),
-                margin=to_decimal(data.get("CurrMargin")),
-                frozen_margin=to_decimal(data.get("FrozenMargin")),
-                frozen_cash=to_decimal(data.get("FrozenCash")),
-                profit_loss=to_decimal(data.get("PositionProfit")),
-                commission=to_decimal(data.get("Commission")),
+        for item in raw_positions:
+            if float(item.volume or 0) <= 0:
+                continue
+            side = position_to_side(item)
+            position = VenuePosition(
+                symbol=item.symbol,
+                venue="CTP",
+                side=side,
+                quantity=Decimal(str(item.volume or 0)),
+                entry_price=Decimal(str(item.price or 0)),
+                unrealized_pnl=Decimal(str(item.pnl or 0)),
                 updated_at=datetime.now(timezone.utc),
             )
-
-            logger.info(
-                "Account query successful",
-                extra={
-                    "account_id": account_id,
-                    "balance": str(info.balance),
-                    "available": str(info.available),
-                    "margin": str(info.margin),
-                },
+            positions.append(position)
+            state_positions.append(
+                PositionState(
+                    symbol=item.symbol,
+                    venue="CTP",
+                    side=side,
+                    quantity=float(item.volume or 0),
+                    entry_price=float(item.price or 0),
+                    unrealized_pnl=float(item.pnl or 0),
+                    updated_at=datetime.now(timezone.utc),
+                )
             )
 
-            return info
+        if self._state_writer is not None:
+            await self._state_writer.replace_positions(state_positions, venue="CTP")
 
-        finally:
-            if original_handler is not None and hasattr(gateway, "on_rsp_qry_trading_account"):
-                gateway.on_rsp_qry_trading_account = original_handler
+        return positions
+
+    async def query_account(self) -> VenueAccountInfo:
+        account = await self._gateway.refresh_account()
+        return self._account_to_info(account)
+
+    async def subscribe_market_data(self, symbols: list[str]) -> None:
+        requests = [
+            SubscribeRequest(symbol=symbol, exchange=self._resolve_exchange(symbol))
+            for symbol in symbols
+        ]
+        self._gateway.subscribe(requests)
 
     async def get_market_status(self, symbol: str) -> BaseMarketStatus:
-        """Get market status for a symbol.
-
-        Args:
-            symbol: Unified symbol.
-
-        Returns:
-            MarketStatus with tradability information.
-        """
         is_connected = self._gateway.is_connected
-
         return BaseMarketStatus(
             symbol=symbol,
             can_market_order=is_connected,
@@ -493,85 +219,143 @@ class CTPAdapter:
             updated_at=datetime.now(timezone.utc),
         )
 
-    def _on_order_update(self, receipt: VenueReceipt) -> None:
-        """Handle order status update from CTP callback.
+    def _resolve_exchange(self, symbol: str) -> Exchange:
+        exchange = self._instrument_exchange.get(symbol)
+        if exchange is None:
+            raise ValueError(f"Unknown exchange for symbol {symbol}; add it to futures/config/instruments_cn.yaml")
+        return exchange
 
-        Args:
-            receipt: VenueReceipt with updated order status.
-        """
-        future = self._order_futures.get(receipt.client_order_id)
-        if future and not future.done():
+    def _on_order_event(self, order: OrderData) -> None:
+        client_order_id = order.reference or self._exchange_to_client_id.get(order.orderid, "")
+        if not client_order_id:
+            return
+
+        self._exchange_to_client_id[order.orderid] = client_order_id
+        self._order_data_by_client_id[client_order_id] = order
+
+        timestamp = self._as_utc(order.datetime)
+        receipt = VenueReceipt(
+            client_order_id=client_order_id,
+            exchange_order_id=order.orderid,
+            status=status_to_receipt(order.status),
+            raw_response={
+                "symbol": order.symbol,
+                "exchange": order.exchange.value,
+                "orderid": order.orderid,
+                "status": order.status.value,
+                "traded": order.traded,
+                "volume": order.volume,
+            },
+            timestamp=timestamp,
+        )
+
+        self._order_status_by_client_id[client_order_id] = VenueOrderStatus(
+            client_order_id=client_order_id,
+            exchange_order_id=order.orderid,
+            status=receipt.status,
+            filled_quantity=Decimal(str(order.traded or 0)),
+            filled_price=Decimal(str(order.price or 0)),
+            updated_at=timestamp,
+        )
+
+        future = self._pending_futures.get(client_order_id)
+        if future is not None and not future.done():
             future.set_result(receipt)
 
-        if self._state_writer:
-            from core.state_schema import OrderState
-
+        if self._state_writer is not None:
+            spec = self._client_order_specs.get(client_order_id)
+            side = self._state_side(order.direction, spec.side if spec else "BUY")
             order_state = OrderState(
-                order_id=receipt.exchange_order_id or receipt.client_order_id,
-                client_order_id=receipt.client_order_id,
-                symbol="",
+                order_id=order.orderid,
+                client_order_id=client_order_id,
+                symbol=order.symbol,
                 venue="CTP",
-                side="",
-                quantity="0",
-                price=None,
-                status=receipt.status,
-                strategy_id="",
-                created_at="",
-                updated_at=receipt.timestamp.isoformat(),
-                filled_quantity="0",
-                filled_price="0",
+                side=side,
+                quantity=float(order.volume or 0),
+                price=float(order.price) if order.price else None,
+                status=self._state_status(receipt.status),
+                strategy_id=None,
+                created_at=self._created_at_by_client_id.setdefault(client_order_id, timestamp),
+                updated_at=timestamp,
+                filled_quantity=float(order.traded or 0),
+                filled_price=float(order.price or 0),
             )
-            asyncio.create_task(self._state_writer.write_order(order_state))
+            self._schedule_state_write(order_state)
 
-    def _on_trade_update(self, status: dict) -> None:
-        """Handle trade execution update from CTP callback.
-
-        Args:
-            status: Dictionary with trade details.
-        """
-        logger.info(f"Trade update: {status}")
-
-    # ------------------------------------------------------------------
-    # Issue #14: Error log callbacks (append-only, no modification to existing logic)
-    # ------------------------------------------------------------------
-
-    def _write_error_log_async(self, error_id: int, error_msg: str, context: str) -> None:
-        """异步写入 error_log，仅在 self._state_writer 不为 None 时执行。"""
-        if self._state_writer is None:
+    def _on_trade_event(self, trade: TradeData) -> None:
+        client_order_id = self._exchange_to_client_id.get(trade.orderid)
+        if not client_order_id:
             return
-        from core.state_schema import ErrorLogEntry
-        from datetime import datetime, timezone
-        entry = ErrorLogEntry(
-            ts=datetime.now(timezone.utc),
-            error_id=error_id,
-            error_msg=error_msg,
-            context=context,
-        )
-        asyncio.create_task(self._state_writer.write_error_log(entry))
 
-    def on_rsp_error(self, error_id: int, error_msg: str, context_hint: str = "OnRspError") -> None:
-        """安全包装 CTP OnRspError 回调，写入 error_log。"""
-        if self._state_writer is None:
+        existing = self._order_status_by_client_id.get(client_order_id)
+        if existing is None:
             return
-        from venue.ctp_error_codes import CTP_ERROR_MAP
-        formatted = CTP_ERROR_MAP.get(error_id, ("未知错误", error_msg))[1]
-        self._write_error_log_async(
-            error_id=error_id,
-            error_msg=formatted,
-            context=f"{context_hint}",
+
+        timestamp = self._as_utc(trade.datetime)
+        self._order_status_by_client_id[client_order_id] = VenueOrderStatus(
+            client_order_id=client_order_id,
+            exchange_order_id=trade.orderid,
+            status=existing.status,
+            filled_quantity=Decimal(str(trade.volume or existing.filled_quantity)),
+            filled_price=Decimal(str(trade.price or existing.filled_price)),
+            updated_at=timestamp,
         )
 
-    def on_err_rtn_order(self, error_id: int, error_msg: str, context_hint: str = "OnErrRtnOrder") -> None:
-        """安全包装 CTP OnErrRtnOrder 回调，写入 error_log。"""
+    def _schedule_state_write(self, order_state: OrderState) -> None:
         if self._state_writer is None:
             return
-        from venue.ctp_error_codes import CTP_ERROR_MAP
-        formatted = CTP_ERROR_MAP.get(error_id, ("未知错误", error_msg))[1]
-        self._write_error_log_async(
-            error_id=error_id,
-            error_msg=formatted,
-            context=f"{context_hint}",
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._state_writer.write_order(order_state))
+        except RuntimeError:
+            loop = self._gateway._loop
+            if loop is not None:
+                loop.call_soon_threadsafe(loop.create_task, self._state_writer.write_order(order_state))
+
+    def _account_to_info(self, account: AccountData) -> VenueAccountInfo:
+        balance = Decimal(str(account.balance or 0))
+        available = Decimal(str(getattr(account, "available", 0) or 0))
+        frozen = Decimal(str(account.frozen or 0))
+        return VenueAccountInfo(
+            account_id=account.accountid,
+            broker_id=self._config.get("broker_id", getattr(self._gateway, "broker_id", "")),
+            balance=balance,
+            available=available,
+            margin=frozen,
+            frozen_margin=frozen,
+            frozen_cash=Decimal("0"),
+            profit_loss=Decimal("0"),
+            commission=Decimal("0"),
+            updated_at=datetime.now(timezone.utc),
         )
 
-# Alias for backwards compatibility with run_futures.py
+    @staticmethod
+    def _state_side(direction: Direction | None, fallback: str) -> OrderSide:
+        if direction == Direction.SHORT:
+            return OrderSide.SELL
+        if direction == Direction.LONG:
+            return OrderSide.BUY
+        return OrderSide(fallback)
+
+    @staticmethod
+    def _state_status(status: str) -> OrderStatus:
+        mapping = {
+            "SENT": OrderStatus.SENT,
+            "PARTIALLY_FILLED": OrderStatus.PARTIALLY_FILLED,
+            "FILLED": OrderStatus.FILLED,
+            "CANCELED": OrderStatus.CANCELED,
+            "REJECTED": OrderStatus.REJECTED,
+        }
+        return mapping.get(status, OrderStatus.FAILED)
+
+    @staticmethod
+    def _as_utc(value: datetime | None) -> datetime:
+        if value is None:
+            return datetime.now(timezone.utc)
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+
 CtpAdapter = CTPAdapter
+

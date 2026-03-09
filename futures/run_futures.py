@@ -1,123 +1,172 @@
 """
 FUTURES ONLY - DO NOT IMPORT CRYPTO MODULES
 
-期货独立启动入口
-AppID: client_aiagentts_1.0.0
-开发人：方钰涵
-
-启动顺序：DB建表 → StateWriter → CtpAdapter → OutboxDispatcher → Streamlit
-
-使用方式：
-    cd <repo_root>
-    python -m futures.run_futures
+Standalone startup for the CTP futures workflow.
 """
 
 import asyncio
+import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiosqlite
 import yaml
 from loguru import logger
 
+from core.state_schema import SystemLogEntry
 from core.state_writer import StateWriter
 from core.outbox_dispatcher import OutboxDispatcher
 from venue.ctp_adapter import CtpAdapter
+from venue.ctp_md_gateway import CtpMdGateway
+from venue.ctp_utils import build_ctp_runtime_config
 
-REPO_ROOT   = Path(__file__).parent.parent
+REPO_ROOT = Path(__file__).parent.parent
 CONFIG_PATH = Path(__file__).parent / "config" / "risk_params_futures.yaml"
 SCHEMA_PATH = REPO_ROOT / "db" / "schema.sql"
+DASHBOARD_PATH = REPO_ROOT / "dashboard" / "streamlit_mvp" / "app.py"
 
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
-        logger.error(f"配置文件不存在: {CONFIG_PATH}")
+        logger.error(f"Config file not found: {CONFIG_PATH}")
         sys.exit(1)
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+        config = yaml.safe_load(fh) or {}
+
+    config["broker_id"] = os.getenv("CTP_BROKER_ID", config.get("broker_id", ""))
+    config["user_id"] = os.getenv("CTP_USER_ID", config.get("user_id", ""))
+    config["password"] = os.getenv("CTP_PASSWORD", config.get("password", ""))
+    config["ctp_td_front_addr"] = os.getenv(
+        "CTP_TD_FRONT",
+        config.get("ctp_td_front_addr") or config.get("ctp_front_addr", ""),
+    )
+    config["ctp_md_front_addr"] = os.getenv(
+        "CTP_MD_FRONT",
+        config.get("ctp_md_front_addr") or config.get("ctp_md_front_addr", ""),
+    )
+    config["ctp_counter_env"] = os.getenv(
+        "CTP_COUNTER_ENV",
+        config.get("ctp_counter_env", "实盘"),
+    )
+    config["db_path"] = config.get("db_path", "./data/trading.db")
+    return config
 
 
 async def init_database(db_path: str) -> None:
-    """Create data/ dir and apply schema.sql (IF NOT EXISTS, safe to re-run)."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     if not SCHEMA_PATH.exists():
-        logger.error(f"Schema 文件不存在: {SCHEMA_PATH}")
+        logger.error(f"Schema file not found: {SCHEMA_PATH}")
         sys.exit(1)
     schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
     async with aiosqlite.connect(db_path) as db:
         await db.executescript(schema_sql)
         await db.commit()
-    logger.info(f"[Futures] 数据库建表完成: {db_path}")
+    logger.info("[Futures] database initialized: %s", db_path)
 
 
 async def main() -> None:
-    logger.info("[Futures] 启动期货交易系统...")
-    logger.info("[Futures] AppID: client_aiagentts_1.0.0")
+    logger.info("[Futures] starting futures trading stack")
 
     config = load_config()
-    db_path = config.get("db_path", "./data/futures.db")
+    db_path = config["db_path"]
+    default_symbols = list(config.get("default_subscribe_symbols", []))
 
-    # 0. 数据库建表
-    logger.info("[Futures] 初始化数据库...")
+    runtime_config = build_ctp_runtime_config(config)
+    logger.info(
+        "[Futures] broker=%s user=%s td=%s md=%s env=%s",
+        runtime_config["broker_id"],
+        runtime_config["user_id"],
+        runtime_config["ctp_td_front_addr"],
+        runtime_config["ctp_md_front_addr"],
+        runtime_config["ctp_counter_env"],
+    )
+
     await init_database(db_path)
 
-    # 1. StateWriter
-    logger.info("[Futures] 初始化 StateWriter...")
     state_writer = StateWriter(db_path=db_path)
     await state_writer.start()
-
-    # 2. CtpAdapter（必须先于 OutboxDispatcher，因为 dispatcher 需要它作为 venue_adapter）
-    logger.info("[Futures] 初始化 CtpAdapter...")
-    ctp_config = {
-        "broker_id":  config.get("broker_id", ""),
-        "user_id":    config.get("user_id", ""),
-        "app_id":     config.get("app_id", "client_aiagentts_1.0.0"),
-        "front_addr": config.get("ctp_front_addr", ""),
-        "password":   config.get("password", ""),
-        "auth_code":  config.get("auth_code", ""),
-    }
-    ctp_adapter = CtpAdapter(config=ctp_config, state_writer=state_writer)
-    logger.info("[Futures] 连接 CTP 前置机...")
-    await ctp_adapter.connect()
-    logger.info("[Futures] CTP 连接成功。")
-
-    # 3. OutboxDispatcher（正确参数: state_writer + venue_adapter，没有 event_bus）
-    logger.info("[Futures] 初始化 OutboxDispatcher...")
-    dispatcher = OutboxDispatcher(
-        state_writer=state_writer,
-        venue_adapter=ctp_adapter,          # ✅ 正确参数
-        poll_interval=0.5,
-        max_retries=config.get("reconnect_max_retries", 5),
-    )
-    await dispatcher.start()                # ✅ 正确方法（无 run()）
-
-    # 4. Streamlit Dashboard（#15 实现后生效）
-    dashboard_path = REPO_ROOT / "dashboard" / "app_futures.py"
-    if dashboard_path.exists():
-        logger.info("[Futures] 启动 Streamlit Dashboard...")
-        subprocess.Popen(
-            [sys.executable, "-m", "streamlit", "run", str(dashboard_path),
-             "--server.port", "8501"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+    await state_writer.write_system_log(
+        SystemLogEntry(
+            ts=datetime.now(timezone.utc),
+            event_type="STARTUP",
+            detail="futures.run_futures",
         )
-    else:
-        logger.warning(f"[Futures] Dashboard 未找到: {dashboard_path}（#15 完成后生效）")
+    )
 
-    # 5. 保活事件循环（Ctrl+C 可优雅退出）
-    logger.info("[Futures] 系统启动完成，运行中（Ctrl+C 可退出）...")
-    stop_event = asyncio.Event()
+    ctp_adapter = CtpAdapter(config=runtime_config, state_writer=state_writer)
+    md_gateway = CtpMdGateway(config=runtime_config, gateway_wrapper=ctp_adapter.gateway_wrapper)
+
+    dispatcher: OutboxDispatcher | None = None
     try:
-        await stop_event.wait()             # 永久防塞，直到 KeyboardInterrupt
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info("[Futures] 收到停止信号，正在关闭...")
+        logger.info("[Futures] connecting TD")
+        await ctp_adapter.connect()
+
+        logger.info("[Futures] querying account snapshot")
+        await ctp_adapter.query_account()
+
+        logger.info("[Futures] querying positions snapshot")
+        await ctp_adapter.query_positions()
+
+        logger.info("[Futures] connecting MD")
+        await md_gateway.connect(default_symbols or None)
+
+        logger.info("[Futures] starting outbox dispatcher")
+        dispatcher = OutboxDispatcher(
+            state_writer=state_writer,
+            venue_adapter=ctp_adapter,
+            poll_interval=0.5,
+            max_retries=config.get("reconnect_max_retries", 5),
+            instrument_config_path=str(REPO_ROOT / "futures" / "config" / "instruments_cn.yaml"),
+            semantic_config={
+                **config,
+                "require_account_snapshot": True,
+            },
+        )
+        await dispatcher.start()
+
+        if DASHBOARD_PATH.exists():
+            logger.info("[Futures] starting Streamlit dashboard")
+            env = os.environ.copy()
+            env["AIAGENTTS_DB"] = str(Path(db_path).resolve())
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "streamlit",
+                    "run",
+                    str(DASHBOARD_PATH),
+                    "--server.port",
+                    "8501",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+        else:
+            logger.warning("[Futures] dashboard not found: %s", DASHBOARD_PATH)
+
+        logger.info("[Futures] startup complete")
+        await asyncio.Event().wait()
+    except Exception:
+        logger.exception("[Futures] startup failed")
+        raise
     finally:
-        await dispatcher.stop()
+        if dispatcher is not None:
+            await dispatcher.stop()
+        await md_gateway.disconnect()
         await ctp_adapter.disconnect()
+        await state_writer.write_system_log(
+            SystemLogEntry(
+                ts=datetime.now(timezone.utc),
+                event_type="SHUTDOWN",
+                detail="futures.run_futures",
+            )
+        )
         await state_writer.stop()
-        logger.info("[Futures] 已安全关闭。")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+

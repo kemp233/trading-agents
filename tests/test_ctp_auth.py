@@ -1,194 +1,110 @@
-"""Tests for CTP authentication flow (穿透式认证).
-
-Covers:
-- Successful authenticate → login sequence
-- Authentication failure (wrong AuthCode)
-- Login failure (wrong password)
-- Reconnect re-triggers authenticate → login
-"""
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import sys
-from types import ModuleType
-from unittest.mock import AsyncMock, MagicMock, patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
+from vnpy.trader.object import AccountData
 
 from venue.ctp_gateway import CtpGatewayWrapper
+from venue.ctp_utils import build_vnpy_setting
 
 
 CONFIG = {
     "broker_id": "9999",
     "user_id": "test_user",
     "password": "test_pass",
-    "app_id": "client_aiagentts_1.0.0",
+    "app_id": "simnow_client_test",
     "auth_code": "0000000000000000",
-    "front_addr": "tcp://180.168.146.187:10130",
+    "ctp_td_front_addr": "tcp://182.254.243.31:40001",
+    "ctp_md_front_addr": "tcp://182.254.243.31:40011",
+    "ctp_counter_env": "实盘",
 }
 
 
-def _fake_vnpy_modules(gw_instance: MagicMock) -> dict:
-    """Build minimal fake vnpy_ctp.gateway sys.modules entries.
+class _FakeEventEngine:
+    def register(self, *_args, **_kwargs) -> None:
+        return None
 
-    CtpGateway is imported *inside* connect() as a local import:
-        from vnpy_ctp.gateway import CtpGateway
-    so we must inject into sys.modules rather than patching the
-    venue.ctp_gateway namespace.
-    """
-    fake_gw_cls = MagicMock(return_value=gw_instance)
+    def start(self) -> None:
+        return None
 
-    fake_vnpy = ModuleType("vnpy_ctp")
-    fake_vnpy_gateway = ModuleType("vnpy_ctp.gateway")
-    fake_vnpy_gateway.CtpGateway = fake_gw_cls  # type: ignore[attr-defined]
-    fake_vnpy.gateway = fake_vnpy_gateway  # type: ignore[attr-defined]
-
-    return {"vnpy_ctp": fake_vnpy, "vnpy_ctp.gateway": fake_vnpy_gateway}
+    def stop(self) -> None:
+        return None
 
 
-class TestCtpAuthFlow:
-    """Tests for the full CTP authenticate → login flow."""
+def _fake_modules(gw_instance: MagicMock) -> dict:
+    fake_cls = MagicMock(return_value=gw_instance)
+    fake_vnpy_ctp = ModuleType("vnpy_ctp")
+    fake_gateway = ModuleType("vnpy_ctp.gateway")
+    fake_gateway.CtpGateway = fake_cls  # type: ignore[attr-defined]
+    fake_vnpy_ctp.gateway = fake_gateway  # type: ignore[attr-defined]
 
-    def _make_wrapper(self) -> CtpGatewayWrapper:
-        return CtpGatewayWrapper(CONFIG)
+    fake_vnpy = ModuleType("vnpy")
+    fake_event = ModuleType("vnpy.event")
+    fake_event.EventEngine = _FakeEventEngine  # type: ignore[attr-defined]
+    fake_vnpy.event = fake_event  # type: ignore[attr-defined]
 
-    def test_on_front_connected_calls_authenticate(self) -> None:
-        """_on_front_connected must call gateway.authenticate with correct AppID."""
-        wrapper = self._make_wrapper()
-        mock_gateway = MagicMock()
-        wrapper._gateway = mock_gateway
+    return {
+        "vnpy": fake_vnpy,
+        "vnpy.event": fake_event,
+        "vnpy_ctp": fake_vnpy_ctp,
+        "vnpy_ctp.gateway": fake_gateway,
+    }
 
-        wrapper._on_front_connected()
 
-        mock_gateway.authenticate.assert_called_once()
-        call_args = mock_gateway.authenticate.call_args[0][0]
-        assert call_args["AppID"] == "client_aiagentts_1.0.0"
-        assert call_args["AuthCode"] == CONFIG["auth_code"]
-        assert call_args["BrokerID"] == CONFIG["broker_id"]
-        assert call_args["UserID"] == CONFIG["user_id"]
+def test_build_vnpy_setting_includes_counter_env() -> None:
+    setting = build_vnpy_setting(CONFIG)
+    assert setting["用户名"] == "test_user"
+    assert setting["交易服务器"] == "tcp://182.254.243.31:40001"
+    assert setting["行情服务器"] == "tcp://182.254.243.31:40011"
+    assert setting["柜台环境"] == "实盘"
 
-    def test_on_rsp_authenticate_success_calls_login(self) -> None:
-        """Successful authenticate response must trigger ReqUserLogin."""
-        wrapper = self._make_wrapper()
-        mock_gateway = MagicMock()
-        wrapper._gateway = mock_gateway
 
-        wrapper._on_rsp_authenticate(
-            data={"BrokerID": "9999"},
-            error={"ErrorID": 0, "ErrorMsg": ""},
-            reqid=1,
-            last=True,
-        )
+@pytest.mark.asyncio
+async def test_connect_timeout_raises_timeout_error() -> None:
+    wrapper = CtpGatewayWrapper(CONFIG)
+    gateway = MagicMock()
+    gateway.connect = MagicMock()
 
-        mock_gateway.login.assert_called_once()
-        login_args = mock_gateway.login.call_args[0][0]
-        assert login_args["BrokerID"] == CONFIG["broker_id"]
-        assert login_args["UserID"] == CONFIG["user_id"]
-        assert login_args["Password"] == CONFIG["password"]
+    async def fake_wait_for(awaitable, timeout):  # noqa: ARG001
+        if hasattr(awaitable, "close"):
+            awaitable.close()
+        raise asyncio.TimeoutError
 
-    def test_on_rsp_authenticate_failure_does_not_login(self) -> None:
-        """Failed authenticate must NOT call login."""
-        wrapper = self._make_wrapper()
-        mock_gateway = MagicMock()
-        wrapper._gateway = mock_gateway
+    with patch.dict(sys.modules, _fake_modules(gateway)):
+        with patch("asyncio.wait_for", side_effect=fake_wait_for):
+            with pytest.raises(TimeoutError, match="CTP login timeout"):
+                await wrapper.connect()
 
-        wrapper._on_rsp_authenticate(
-            data={},
-            error={"ErrorID": 35, "ErrorMsg": "AppID不合法"},
-            reqid=1,
-            last=True,
-        )
 
-        mock_gateway.login.assert_not_called()
+def test_auth_warning_log_does_not_set_login_error() -> None:
+    wrapper = CtpGatewayWrapper(CONFIG)
+    event = SimpleNamespace(data=SimpleNamespace(msg="CTP:认证码错误，当前系统或者用户豁免终端认证，可以登录"))
+    wrapper._on_log(event)
+    assert wrapper._auth_warning is not None
+    assert wrapper._login_error is None
 
-    def test_on_rsp_user_login_success_sets_event(self) -> None:
-        """Successful login response must set the _login_event."""
-        wrapper = self._make_wrapper()
 
-        assert not wrapper._login_event.is_set()
+def test_login_failure_log_sets_login_error() -> None:
+    wrapper = CtpGatewayWrapper(CONFIG)
+    event = SimpleNamespace(data=SimpleNamespace(msg="CTP:不合法的登录"))
+    wrapper._on_log(event)
+    assert wrapper._login_error == "CTP:不合法的登录"
 
-        wrapper._on_rsp_user_login(
-            data={"UserID": "test_user", "FrontID": 1, "SessionID": 123},
-            error={"ErrorID": 0, "ErrorMsg": ""},
-            reqid=2,
-            last=True,
-        )
 
-        assert wrapper._login_event.is_set()
+@pytest.mark.asyncio
+async def test_account_event_marks_connected() -> None:
+    wrapper = CtpGatewayWrapper(CONFIG)
+    wrapper._loop = asyncio.get_running_loop()
+    account = AccountData(gateway_name="CTP", accountid="test_user", balance=1000, frozen=200)
 
-    def test_on_rsp_user_login_failure_does_not_set_event(self) -> None:
-        """Failed login must NOT set the _login_event."""
-        wrapper = self._make_wrapper()
+    wrapper._on_account(SimpleNamespace(data=account))
+    await asyncio.sleep(0)
 
-        wrapper._on_rsp_user_login(
-            data={},
-            error={"ErrorID": 20, "ErrorMsg": "密码错误"},
-            reqid=2,
-            last=True,
-        )
+    assert wrapper.is_connected is True
+    assert wrapper._login_event.is_set() is True
+    assert wrapper._account_event.is_set() is True
 
-        assert not wrapper._login_event.is_set()
-
-    def test_on_rsp_user_login_none_error_sets_event(self) -> None:
-        """Login response with error=None (success) must still set _login_event."""
-        wrapper = self._make_wrapper()
-
-        wrapper._on_rsp_user_login(
-            data={"UserID": "test_user"},
-            error=None,
-            reqid=2,
-            last=True,
-        )
-
-        assert wrapper._login_event.is_set()
-
-    def test_app_id_is_correct(self) -> None:
-        """AppID must exactly match client_aiagentts_1.0.0 per 穿透式认证 spec."""
-        wrapper = self._make_wrapper()
-        assert wrapper.app_id == "client_aiagentts_1.0.0"
-
-    @pytest.mark.asyncio
-    async def test_connect_timeout_raises_timeout_error(self) -> None:
-        """connect() must raise TimeoutError when _login_event never fires.
-
-        CtpGateway is imported *inside* connect() as a local import, so we
-        inject a fake module via sys.modules instead of patching the
-        venue.ctp_gateway namespace (which doesn't carry that name).
-        """
-        wrapper = self._make_wrapper()
-
-        mock_gw_instance = MagicMock()
-        mock_gw_instance.connect = MagicMock()  # sync, does nothing
-
-        fake_modules = _fake_vnpy_modules(mock_gw_instance)
-
-        with patch.dict(sys.modules, fake_modules):
-            # asyncio.wait_for times out → gateway raises TimeoutError
-            with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError):
-                with pytest.raises(TimeoutError, match="CTP login timeout"):
-                    await wrapper.connect()
-
-    @pytest.mark.asyncio
-    async def test_disconnect_after_connect_clears_state(self) -> None:
-        """disconnect() must mark gateway as not connected and clear login event."""
-        wrapper = self._make_wrapper()
-        wrapper._connected = True
-        wrapper._login_event.set()
-        wrapper._gateway = MagicMock()
-        wrapper._should_reconnect = True
-
-        await wrapper.disconnect()
-
-        assert not wrapper._connected
-        assert not wrapper._login_event.is_set()
-
-    def test_front_disconnected_clears_connected_flag(self) -> None:
-        """_on_front_disconnected must clear _connected and _login_event."""
-        wrapper = self._make_wrapper()
-        wrapper._connected = True
-        wrapper._login_event.set()
-
-        wrapper._on_front_disconnected(reason=4097)
-
-        assert not wrapper._connected
-        assert not wrapper._login_event.is_set()

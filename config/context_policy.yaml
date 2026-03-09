@@ -1,0 +1,72 @@
+defaults:
+  lookback_days: 3
+  allow_active_chat: false
+  allow_daily_summaries: true
+  allow_daily_fact_snapshots: true
+  max_items: 8
+  max_chars: 4000
+  max_tokens_estimate: 1200
+  summary_first: true
+  allowed_sources: []
+  denied_sources: []
+
+orchestration:
+  allow_active_chat: true
+  allowed_sources:
+    - active_chat
+    - daily_fact_snapshots
+    - daily_summaries
+    - portfolio_snapshot
+    - risk_state
+  max_items: 10
+  max_chars: 6000
+  max_tokens_estimate: 1800
+
+strategy:
+  allow_active_chat: false
+  allowed_sources:
+    - market_snapshot
+    - news_summary
+    - portfolio_snapshot
+    - risk_state
+    - daily_summaries
+    - daily_fact_snapshots
+  denied_sources:
+    - chat_messages_all
+    - system_log_all
+    - monitor_log_all
+  max_items: 7
+  max_chars: 3500
+  max_tokens_estimate: 1100
+  summary_first: true
+
+risk:
+  allow_active_chat: false
+  lookback_days: 1
+  allowed_sources:
+    - orders_today
+    - positions_today
+    - risk_state_today
+    - approval_context
+    - strategy_advice
+    - daily_fact_snapshots
+  denied_sources:
+    - free_chat_history
+    - historical_threads
+  max_items: 8
+  max_chars: 3200
+  max_tokens_estimate: 1000
+  summary_first: true
+
+news:
+  allow_active_chat: false
+  allowed_sources:
+    - query
+    - active_symbols
+    - daily_summaries
+  denied_sources:
+    - chat_messages_all
+  max_items: 6
+  max_chars: 2800
+  max_tokens_estimate: 900
+  summary_first: true

@@ -38,3 +38,13 @@ logs/
 # Node (dashboard react app)
 node_modules/
 dashboard/react_app/build/
+
+config/provider_secrets.local.json
+
+config/workflow_assignments.local.json
+output/
+docs/records/
+*.local.json
+ctp_flow_pd_*/
+.vntrader_runtime/
+

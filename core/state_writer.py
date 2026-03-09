@@ -18,7 +18,13 @@ from .state_schema import (
 
 
 class StateWriter:
-    def __init__(self, db_path: str, queue_size: int = 1000, batch_size: int = 50, batch_timeout: float = 0.1) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        queue_size: int = 1000,
+        batch_size: int = 50,
+        batch_timeout: float = 0.1,
+    ) -> None:
         self._db_path = db_path
         self._queue_size = queue_size
         self._batch_size = batch_size
@@ -26,7 +32,7 @@ class StateWriter:
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=queue_size)
         self._writer_task: Optional[asyncio.Task] = None
         self._db: Optional[aiosqlite.Connection] = None
-        self._running: bool = False
+        self._running = False
 
     async def start(self) -> None:
         self._db = await aiosqlite.connect(self._db_path)
@@ -65,7 +71,7 @@ class StateWriter:
     async def query_orders_by_status(self, status: str) -> List[OrderState]:
         if self._db is None:
             raise RuntimeError("Database not initialized")
-        orders = []
+        orders: list[OrderState] = []
         async with self._db.execute("SELECT * FROM orders WHERE status = ?", (status,)) as cursor:
             async for row in cursor:
                 orders.append(OrderState.from_dict(dict(row)))
@@ -74,7 +80,7 @@ class StateWriter:
     async def query_positions(self) -> List[PositionState]:
         if self._db is None:
             raise RuntimeError("Database not initialized")
-        positions = []
+        positions: list[PositionState] = []
         async with self._db.execute("SELECT * FROM positions") as cursor:
             async for row in cursor:
                 positions.append(PositionState.from_dict(dict(row)))
@@ -87,10 +93,10 @@ class StateWriter:
             row = await cursor.fetchone()
             if row is None:
                 return None
-            d = dict(row)
-            if isinstance(d.get("metadata"), str):
-                d["metadata"] = json.loads(d["metadata"])
-            return RiskState.from_dict(d)
+            payload = dict(row)
+            if isinstance(payload.get("metadata"), str):
+                payload["metadata"] = json.loads(payload["metadata"])
+            return RiskState.from_dict(payload)
 
     async def save_checkpoint(self, stream_sequences: Dict[str, int], processed_keys: Set[str]) -> None:
         if self._db is None:
@@ -103,22 +109,23 @@ class StateWriter:
             )
         for idempotency_key in processed_keys:
             parts = idempotency_key.rsplit(":", 1)
-            if len(parts) == 2:
-                stream_id, stream_seq = parts
-                try:
-                    seq_int = int(stream_seq)
-                    await self._db.execute(
-                        "INSERT OR IGNORE INTO processed_events(stream_id, stream_seq, idempotency_key, processed_at) VALUES (?, ?, ?, ?)",
-                        (stream_id, seq_int, idempotency_key, now),
-                    )
-                except ValueError:
-                    pass
+            if len(parts) != 2:
+                continue
+            stream_id, stream_seq = parts
+            try:
+                seq_int = int(stream_seq)
+            except ValueError:
+                continue
+            await self._db.execute(
+                "INSERT OR IGNORE INTO processed_events(stream_id, stream_seq, idempotency_key, processed_at) VALUES (?, ?, ?, ?)",
+                (stream_id, seq_int, idempotency_key, now),
+            )
         await self._db.commit()
 
     async def load_checkpoints(self) -> Dict[str, int]:
         if self._db is None:
             raise RuntimeError("Database not initialized")
-        checkpoints = {}
+        checkpoints: dict[str, int] = {}
         async with self._db.execute("SELECT stream_id, last_seq FROM stream_checkpoints") as cursor:
             async for row in cursor:
                 checkpoints[row["stream_id"]] = row["last_seq"]
@@ -127,7 +134,7 @@ class StateWriter:
     async def load_processed_events(self, limit: int = 10000) -> Set[str]:
         if self._db is None:
             raise RuntimeError("Database not initialized")
-        keys = set()
+        keys: set[str] = set()
         async with self._db.execute(
             "SELECT idempotency_key FROM processed_events ORDER BY processed_at DESC LIMIT ?",
             (limit,),
@@ -136,16 +143,10 @@ class StateWriter:
                 keys.add(row["idempotency_key"])
         return keys
 
-    # ------------------------------------------------------------------
-    # Issue #14: Direct-write log methods (bypass queue for append-only tables)
-    # ------------------------------------------------------------------
-
     async def write_monitor_log(self, entry: MonitorLogEntry) -> None:
-        """写入阈值预警/触发记录到 monitor_log 表。"""
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
-                "INSERT INTO monitor_log (ts, field, current_value, limit_value, level) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO monitor_log (ts, field, current_value, limit_value, level) VALUES (?, ?, ?, ?, ?)",
                 (
                     entry.ts.isoformat(),
                     entry.field,
@@ -157,35 +158,81 @@ class StateWriter:
             await db.commit()
 
     async def write_system_log(self, entry: SystemLogEntry) -> None:
-        """写入系统事件记录到 system_log 表。"""
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
                 "INSERT INTO system_log (ts, event_type, detail) VALUES (?, ?, ?)",
-                (
-                    entry.ts.isoformat(),
-                    entry.event_type,
-                    entry.detail,
-                ),
+                (entry.ts.isoformat(), entry.event_type, entry.detail),
             )
             await db.commit()
 
     async def write_error_log(self, entry: ErrorLogEntry) -> None:
-        """写入 CTP 错误回调记录到 error_log 表。"""
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
                 "INSERT INTO error_log (ts, error_id, error_msg, context) VALUES (?, ?, ?, ?)",
-                (
-                    entry.ts.isoformat(),
-                    entry.error_id,
-                    entry.error_msg,
-                    entry.context,
-                ),
+                (entry.ts.isoformat(), entry.error_id, entry.error_msg, entry.context),
             )
             await db.commit()
 
-    # ------------------------------------------------------------------
-    # Writer loop (internal)
-    # ------------------------------------------------------------------
+    async def write_connection_log(
+        self,
+        status: str,
+        front_addr: str = "",
+        session_id: str = "",
+        detail: str = "",
+        ts: datetime | None = None,
+    ) -> None:
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO connection_log (ts, status, front_addr, session_id, detail) VALUES (?, ?, ?, ?, ?)",
+                ((ts or datetime.utcnow()).isoformat(), status, front_addr, session_id, detail),
+            )
+            await db.commit()
+
+    async def write_account_info(
+        self,
+        user_id: str,
+        broker_id: str,
+        trading_day: str,
+        available: float,
+        margin: float,
+        equity: float,
+        ts: datetime | None = None,
+    ) -> None:
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                "INSERT INTO account_info (ts, user_id, broker_id, trading_day, available, margin, equity) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ((ts or datetime.utcnow()).isoformat(), user_id, broker_id, trading_day, available, margin, equity),
+            )
+            await db.commit()
+
+    async def query_latest_account_info(self) -> dict | None:
+        if self._db is None:
+            raise RuntimeError("Database not initialized")
+        async with self._db.execute(
+            "SELECT * FROM account_info ORDER BY ts DESC, id DESC LIMIT 1"
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def replace_positions(self, positions: list[PositionState], venue: str = "CTP") -> None:
+        if self._db is None:
+            raise RuntimeError("Database not initialized")
+        await self._db.execute("DELETE FROM positions WHERE venue = ?", (venue,))
+        for pos in positions:
+            data = pos.to_dict()
+            await self._db.execute(
+                "INSERT OR REPLACE INTO positions (symbol, venue, side, quantity, entry_price, unrealized_pnl, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    data["symbol"],
+                    data["venue"],
+                    data["side"],
+                    data["quantity"],
+                    data["entry_price"],
+                    data["unrealized_pnl"],
+                    data["updated_at"],
+                ),
+            )
+        await self._db.commit()
 
     async def _writer_loop(self) -> None:
         while self._running:
@@ -285,42 +332,30 @@ class StateWriter:
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         await self.stop()
 
-    # ------------------------------------------------------------------
-    # Issue #14: Query methods (sync-style wrappers, append-only)
-    # ------------------------------------------------------------------
-
     async def query_monitor_log(self, limit: int = 100) -> list[dict]:
-        """查询 monitor_log 表最近 N 条记录。"""
         if self._db is None:
             raise RuntimeError("Database not initialized")
         rows: list[dict] = []
-        async with self._db.execute(
-            "SELECT * FROM monitor_log ORDER BY ts DESC LIMIT ?", (limit,)
-        ) as cursor:
+        async with self._db.execute("SELECT * FROM monitor_log ORDER BY ts DESC LIMIT ?", (limit,)) as cursor:
             async for row in cursor:
                 rows.append(dict(row))
         return rows
 
     async def query_system_log(self, limit: int = 100) -> list[dict]:
-        """查询 system_log 表最近 N 条记录。"""
         if self._db is None:
             raise RuntimeError("Database not initialized")
         rows: list[dict] = []
-        async with self._db.execute(
-            "SELECT * FROM system_log ORDER BY ts DESC LIMIT ?", (limit,)
-        ) as cursor:
+        async with self._db.execute("SELECT * FROM system_log ORDER BY ts DESC LIMIT ?", (limit,)) as cursor:
             async for row in cursor:
                 rows.append(dict(row))
         return rows
 
     async def query_error_log(self, limit: int = 100) -> list[dict]:
-        """查询 error_log 表最近 N 条记录。"""
         if self._db is None:
             raise RuntimeError("Database not initialized")
         rows: list[dict] = []
-        async with self._db.execute(
-            "SELECT * FROM error_log ORDER BY ts DESC LIMIT ?", (limit,)
-        ) as cursor:
+        async with self._db.execute("SELECT * FROM error_log ORDER BY ts DESC LIMIT ?", (limit,)) as cursor:
             async for row in cursor:
                 rows.append(dict(row))
         return rows
+

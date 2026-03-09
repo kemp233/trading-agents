@@ -1,0 +1,50 @@
+﻿{
+  "orchestration": {
+    "display_name": "总控协调",
+    "provider_ids": ["codex", "deepseek-reasoner"],
+    "api_interfaces": ["responses", "chat_completion"],
+    "description": "负责群聊总控、任务拆分与跨角色协调"
+  },
+  "strategy": {
+    "display_name": "策略分析",
+    "provider_ids": ["deepseek-reasoner", "qwen"],
+    "api_interfaces": ["chat_completion", "chat_completion"],
+    "description": "负责策略推演、信号解释与思路输出"
+  },
+  "risk": {
+    "display_name": "风控治理",
+    "provider_ids": ["deepseek-reasoner", "codex"],
+    "api_interfaces": ["chat_completion", "responses"],
+    "description": "负责风控审查、熔断建议和异常处理"
+  },
+  "execution": {
+    "display_name": "执行管理",
+    "provider_ids": ["qwen", "doubao"],
+    "api_interfaces": ["chat_completion", "chat_completion"],
+    "description": "负责订单执行、撤单和平仓指令协调"
+  },
+  "market-data": {
+    "display_name": "行情感知",
+    "provider_ids": ["perplexity-pro", "deepseek-chat"],
+    "api_interfaces": ["search_chat", "chat_completion"],
+    "description": "负责行情摘要、市场背景与信息补全"
+  },
+  "news": {
+    "display_name": "新闻研究",
+    "provider_ids": ["perplexity-pro", "deepseek-chat"],
+    "api_interfaces": ["search_chat", "chat_completion"],
+    "description": "负责新闻摘要、事件追踪与外部研究"
+  },
+  "reconciliation": {
+    "display_name": "对账复核",
+    "provider_ids": ["doubao", "qwen"],
+    "api_interfaces": ["chat_completion", "chat_completion"],
+    "description": "负责对账结果解释、差异复核与总结"
+  },
+  "portfolio": {
+    "display_name": "组合分析",
+    "provider_ids": ["doubao", "deepseek-chat"],
+    "api_interfaces": ["chat_completion", "chat_completion"],
+    "description": "负责持仓、盈亏、暴露和组合汇总"
+  }
+}
