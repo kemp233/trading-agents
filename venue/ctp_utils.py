@@ -18,6 +18,12 @@ def build_ctp_runtime_config(config: dict) -> dict:
     解析并提取 CTP 运行配置。
     支持从字典或环境变量中读取，并进行合法性校验。
     """
+    # --- 核心修改：自动处理 YAML 中的 ctp 层级嵌套 ---
+    # 如果传入的 config 包含 'ctp' 这个键，则自动进入该子字典
+    if "ctp" in config:
+        config = config["ctp"]
+    # ---------------------------------------------
+
     # 提取认证开关逻辑：默认为 True
     auth_enabled = config.get("auth_enabled", True)
     if isinstance(auth_enabled, str):
