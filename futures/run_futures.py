@@ -35,6 +35,7 @@ def load_config() -> dict:
     with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
         config = yaml.safe_load(fh) or {}
 
+    # 优先读取环境变量，覆盖 YAML 配置
     config["broker_id"] = os.getenv("CTP_BROKER_ID", config.get("broker_id", ""))
     config["user_id"] = os.getenv("CTP_USER_ID", config.get("user_id", ""))
     config["password"] = os.getenv("CTP_PASSWORD", config.get("password", ""))
@@ -75,7 +76,7 @@ async def main() -> None:
 
     runtime_config = build_ctp_runtime_config(config)
     logger.info(
-        "[Futures] broker=%s user=%s td=%s md=%s env=%s",
+        "[Futures] broker={} user={} td={} md={} env={}",
         runtime_config["broker_id"],
         runtime_config["user_id"],
         runtime_config["ctp_td_front_addr"],
@@ -100,18 +101,32 @@ async def main() -> None:
 
     dispatcher: OutboxDispatcher | None = None
     try:
+        # 1. 连接交易前置 (TD) - 必须成功
         logger.info("[Futures] connecting TD")
         await ctp_adapter.connect()
 
+        # 2. 查询资金快照 - 失败不中断启动
         logger.info("[Futures] querying account snapshot")
-        await ctp_adapter.query_account()
+        try:
+            await asyncio.wait_for(ctp_adapter.query_account(), timeout=15.0)
+            logger.info("[Futures] query account snapshot success")
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning(f"[Futures] query account failed or timeout: {e}. Moving on...")
 
+        # 3. 查询持仓快照 - 重点优化：针对空持仓账号不回包的处理
         logger.info("[Futures] querying positions snapshot")
-        await ctp_adapter.query_positions()
+        try:
+            await asyncio.wait_for(ctp_adapter.query_positions(), timeout=15.0)
+            logger.info("[Futures] query positions snapshot success")
+        except (asyncio.TimeoutError, Exception) as e:
+            # 常见于空持仓账号或休市时间，记录警告但不抛出异常
+            logger.warning(f"[Futures] query positions timeout/failed: {e}. Assuming empty positions and continuing...")
 
+        # 4. 连接行情前置 (MD)
         logger.info("[Futures] connecting MD")
         await md_gateway.connect(default_symbols or None)
 
+        # 5. 启动任务调度器
         logger.info("[Futures] starting outbox dispatcher")
         dispatcher = OutboxDispatcher(
             state_writer=state_writer,
@@ -126,6 +141,7 @@ async def main() -> None:
         )
         await dispatcher.start()
 
+        # 6. 启动控制面板 (Streamlit)
         if DASHBOARD_PATH.exists():
             logger.info("[Futures] starting Streamlit dashboard")
             env = os.environ.copy()
@@ -139,6 +155,8 @@ async def main() -> None:
                     str(DASHBOARD_PATH),
                     "--server.port",
                     "8501",
+                    "--server.address",
+                    "0.0.0.0",
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -148,11 +166,14 @@ async def main() -> None:
             logger.warning("[Futures] dashboard not found: %s", DASHBOARD_PATH)
 
         logger.info("[Futures] startup complete")
+        # 阻塞运行
         await asyncio.Event().wait()
+
     except Exception:
         logger.exception("[Futures] startup failed")
         raise
     finally:
+        logger.info("[Futures] shutting down trading stack")
         if dispatcher is not None:
             await dispatcher.stop()
         await md_gateway.disconnect()
@@ -168,5 +189,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
-
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("[Futures] process stopped by user")
