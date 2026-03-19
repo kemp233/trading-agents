@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import inspect
@@ -239,7 +239,6 @@ class CtpGatewayWrapper:
         return self._gateway
 
     def _prepare_vnpy_runtime(self) -> Path:
-
         runtime_temp = Path.cwd() / ".vntrader_runtime"
         runtime_temp.mkdir(parents=True, exist_ok=True)
         trader_utility.TEMP_DIR = runtime_temp
@@ -380,10 +379,10 @@ class CtpGatewayWrapper:
             self._loop.call_soon_threadsafe(asyncio.create_task, coro)
         elif inspect.iscoroutine(coro):
             coro.close()
-            
-   def _describe_fronts(self) -> str:
-       auth_str = "ON" if self.auth_enabled else "OFF"
-      return f"td={self.td_front_addr}; md={self.md_front_addr}; env={self.counter_env}; auth={auth_str}"
+
+    def _describe_fronts(self) -> str:
+        auth_status = "ON" if getattr(self, "auth_enabled", True) else "OFF"
+        return f"td={self.td_front_addr}; md={self.md_front_addr}; env={self.counter_env}; auth={auth_status}"
 
     async def _write_connection_status(
         self,
@@ -409,4 +408,3 @@ class CtpGatewayWrapper:
     @staticmethod
     def _subscription_key(request: SubscribeRequest) -> str:
         return f"{request.symbol}.{request.exchange.value}"
-
