@@ -52,6 +52,7 @@ class CtpGatewayWrapper:
         self.td_front_addr = self._runtime_config["ctp_td_front_addr"]
         self.md_front_addr = self._runtime_config["ctp_md_front_addr"]
         self.counter_env = self._runtime_config["ctp_counter_env"]
+        self.auth_enabled = self._runtime_config.get("auth_enabled", True)
 
         self._event_engine = None
         self._gateway = None
@@ -379,9 +380,10 @@ class CtpGatewayWrapper:
             self._loop.call_soon_threadsafe(asyncio.create_task, coro)
         elif inspect.iscoroutine(coro):
             coro.close()
-
-    def _describe_fronts(self) -> str:
-        return f"td={self.td_front_addr}; md={self.md_front_addr}; env={self.counter_env}"
+            
+   def _describe_fronts(self) -> str:
+       auth_str = "ON" if self.auth_enabled else "OFF"
+      return f"td={self.td_front_addr}; md={self.md_front_addr}; env={self.counter_env}; auth={auth_str}"
 
     async def _write_connection_status(
         self,
