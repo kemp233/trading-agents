@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 from pathlib import Path
@@ -14,8 +14,19 @@ _COUNTER_ENV_ALLOWED = {"实盘", "测试"}
 
 
 def build_ctp_runtime_config(config: dict) -> dict:
+    """
+    解析并提取 CTP 运行配置。
+    支持从字典或环境变量中读取，并进行合法性校验。
+    """
+    # 提取认证开关逻辑：默认为 True
+    auth_enabled = config.get("auth_enabled", True)
+    if isinstance(auth_enabled, str):
+        auth_enabled = auth_enabled.lower() == "true"
+
+    # 环境校验
     counter_env = (
         config.get("ctp_counter_env")
+        or config.get("counter_env")
         or os.getenv("CTP_COUNTER_ENV")
         or "实盘"
     )
@@ -23,8 +34,10 @@ def build_ctp_runtime_config(config: dict) -> dict:
         allowed = ", ".join(sorted(_COUNTER_ENV_ALLOWED))
         raise ValueError(f"ctp_counter_env must be one of {allowed}, got {counter_env!r}")
 
+    # 地址转换
     td_front = (
         config.get("ctp_td_front_addr")
+        or config.get("td_front_addr")
         or config.get("front_addr")
         or os.getenv("CTP_TD_FRONT")
         or os.getenv("CTP_FRONT_ADDR")
@@ -37,27 +50,34 @@ def build_ctp_runtime_config(config: dict) -> dict:
         or td_front
     )
 
+    # 规范化配置字典
     normalized = {
-        "broker_id": config.get("broker_id") or os.getenv("CTP_BROKER_ID", ""),
-        "user_id": config.get("user_id") or os.getenv("CTP_USER_ID", ""),
-        "password": config.get("password") or os.getenv("CTP_PASSWORD", ""),
-        "app_id": config.get("app_id", "simnow_client_test"),
-        "auth_code": config.get("auth_code") or os.getenv("CTP_AUTH_CODE", ""),
+        "broker_id": str(config.get("broker_id") or os.getenv("CTP_BROKER_ID", "")),
+        "user_id": str(config.get("user_id") or os.getenv("CTP_USER_ID", "")),
+        "password": str(config.get("password") or os.getenv("CTP_PASSWORD", "")),
+        "app_id": str(config.get("app_id") or ("simnow_client_test" if auth_enabled else "")),
+        "auth_code": str(config.get("auth_code") or os.getenv("CTP_AUTH_CODE", "")),
         "ctp_td_front_addr": td_front,
         "ctp_md_front_addr": md_front,
         "ctp_counter_env": counter_env,
+        "auth_enabled": auth_enabled,
     }
 
-    required = (
+    # 必填项逻辑校验
+    required = [
         "broker_id",
         "user_id",
-        "app_id",
-        "auth_code",
         "ctp_td_front_addr",
         "ctp_md_front_addr",
         "ctp_counter_env",
-    )
-    missing = [key for key in required if not normalized[key]]
+    ]
+    
+    # 如果开启了认证，则 app_id 和 auth_code 是必填的
+    if auth_enabled:
+        required.append("app_id")
+        required.append("auth_code")
+
+    missing = [key for key in required if not normalized.get(key)]
     if missing:
         raise ValueError(f"Missing required CTP config fields: {', '.join(missing)}")
 
@@ -65,17 +85,30 @@ def build_ctp_runtime_config(config: dict) -> dict:
 
 
 def build_vnpy_setting(config: dict) -> dict:
+    """
+    将原始配置转换为 vnpy_ctp 引擎识别的中文键值对格式。
+    """
     runtime = build_ctp_runtime_config(config)
-    return {
+    
+    setting = {
         "用户名": runtime["user_id"],
         "密码": runtime["password"],
         "经纪商代码": runtime["broker_id"],
         "交易服务器": runtime["ctp_td_front_addr"],
         "行情服务器": runtime["ctp_md_front_addr"],
-        "产品名称": runtime["app_id"],
-        "授权编码": runtime["auth_code"],
         "柜台环境": runtime["ctp_counter_env"],
     }
+    
+    # 处理认证字段：如果 auth_enabled 为 False，产品名称和授权编码置空，
+    # vnpy_ctp 底层将跳过 ReqAuthenticate 步骤。
+    if runtime["auth_enabled"]:
+        setting["产品名称"] = runtime["app_id"]
+        setting["授权编码"] = runtime["auth_code"]
+    else:
+        setting["产品名称"] = ""
+        setting["授权编码"] = ""
+        
+    return setting
 
 
 def load_instrument_exchange_map(config_path: Path | None = None) -> dict[str, Exchange]:
@@ -146,4 +179,3 @@ def account_to_snapshot(account: AccountData, user_id: str, broker_id: str) -> d
 
 def position_to_side(position: PositionData) -> str:
     return "LONG" if position.direction == Direction.LONG else "SHORT"
-
